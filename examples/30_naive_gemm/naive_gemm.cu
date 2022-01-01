@@ -50,7 +50,7 @@ __global__ void gemm(GemmParams params)
     {
         return;
     }
-    float accmulator [ThreadTileT::M][ThreadTileT::N];
+    alignas(sizeof(float4)) float accmulator [ThreadTileT::M][ThreadTileT::N];
 
     // TODO: load accumlator init from C, assume C = 0 for now
     for(int m=0; m<ThreadTileT::M; ++m)
@@ -61,6 +61,8 @@ __global__ void gemm(GemmParams params)
         }
     }
 
+    constexpr int MmaTileM = 4;
+    constexpr int MmaTileN = 4;
     __shared__ float tileA [CtaTileT::K*CtaTileT::M];
     __shared__ float tileB [CtaTileT::K*CtaTileT::N];
 
@@ -95,43 +97,41 @@ __global__ void gemm(GemmParams params)
         //2. sync cta
         __syncthreads();
 
-        constexpr int InstructionM = 4;
-        constexpr int InstructionN = 4;
         //3. do shmem gemm by all threds in this CTA
 
         for(int threadK = 0; threadK < CtaTileT::K; ++threadK)
         {
             static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
             // 32/8
-            for(int instructM =0; instructM < ThreadTileT::M; instructM += InstructionM)
+            for(int instructM =0; instructM < ThreadTileT::M/MmaTileM; instructM += 1)
             {
                 // 8/8
-                for(int instructN = 0; instructN < ThreadTileT::N; instructN += InstructionN)
+                for(int instructN = 0; instructN < ThreadTileT::N/MmaTileN; instructN += 1)
                 {
-                    float fragementA [InstructionM];
-                    float fragementB [InstructionN];
+                    alignas(sizeof(float4)) float fragementA [MmaTileM];
+                    alignas(sizeof(float4)) float fragementB [MmaTileN];
 
                     // fragment A = load A from shmem
                     // fragment B = load B from shmem
-                    int offsetM = threadIdx.x * ThreadTileT::M + instructM;
-                    for(int m = 0; m < InstructionM; m++)
+                    int offsetM = MmaTileM*(instructM * blockDim.x + threadIdx.x);
+                    for(int m = 0; m < MmaTileM; m++)
                     {
                         int shmemA = threadK * CtaTileT::M + offsetM+m;
                         fragementA[m] = tileA[shmemA];
                     }
 
-                    int offsetN = threadIdx.y * ThreadTileT::N + instructN;
-                    for(int n = 0; n < InstructionN; n++)
+                    int offsetN = MmaTileN*(instructN * blockDim.y +  threadIdx.y); 
+                    for(int n = 0; n < MmaTileN; n++)
                     {
                        int shmemB= threadK * CtaTileT::N + offsetN+n;
                        fragementB[n] = tileB[shmemB];
                     }
 
-                    for(int m = 0; m < InstructionM; m++)
+                    for(int m = 0; m < MmaTileM; m++)
                     {
-                        for(int n=0; n < InstructionN; n++)
+                        for(int n=0; n < MmaTileN; n++)
                         {
-                            accmulator[instructM+m][instructN+n] += fragementA[m]* fragementB[n];
+                            accmulator[instructM*MmaTileM+m][instructN*MmaTileN+n] += fragementA[m]* fragementB[n];
 #if DEBUG
                             if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0)
                             {
@@ -147,22 +147,30 @@ __global__ void gemm(GemmParams params)
         __syncthreads();
     };
 
-    int offsetM = blockIdx.x * CtaTileT::M + threadIdx.x * ThreadTileT::M;
-    int offsetN = blockIdx.y * CtaTileT::N + threadIdx.y * ThreadTileT::N;
+    int offsetM = blockIdx.x * CtaTileT::M;
+    int offsetN = blockIdx.y * CtaTileT::N;
 
     // D = alpha * C + beta
-    #pragma unroll ThreadTileT::M
-    for(int m=0; m<ThreadTileT::M; ++m)
+    for(int instructM =0; instructM < ThreadTileT::M/MmaTileM; instructM += 1)
     {
-        #pragma unroll ThreadTileT::M
-        for(int n=0; n<ThreadTileT::N; ++n)
+        for(int instructN = 0; instructN < ThreadTileT::N/MmaTileN; instructN += 1)
         {
-            accmulator[m][n] = params.alpha * accmulator[m][n] + params.beta;
-            //store accumulator into global memory
-            int globalOffsetD = (offsetM+m) * params.N + offsetN +n;
-            reinterpret_cast<float*>(params.ptrD)[globalOffsetD] = accmulator[m][n];
+            auto _offsetM = offsetM + MmaTileM*(instructM * blockDim.x + threadIdx.x);
+            auto _offsetN = offsetN + MmaTileN*(instructN * blockDim.y +  threadIdx.y); 
+            for(int m = 0; m < MmaTileM; m++)
+            {
+                for(int n=0; n < MmaTileN; n++)
+                {
+                    auto x = accmulator[instructM*MmaTileM+m][instructN*MmaTileN+n];
+                    x = params.alpha * x + params.beta;
+                    int globalOffsetD = (_offsetM+m) * params.N + _offsetN +n;
+                    reinterpret_cast<float*>(params.ptrD)[globalOffsetD] = x;
+                }
+            }
         }
     }
+
+
 }
 
 
