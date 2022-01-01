@@ -61,8 +61,8 @@ __global__ void gemm(GemmParams params)
         }
     }
 
-    __shared__ float tileA [CtaTileT::M][CtaTileT::K];
-    __shared__ float tileB [CtaTileT::K][CtaTileT::N];
+    __shared__ float tileA [CtaTileT::K*CtaTileT::M];
+    __shared__ float tileB [CtaTileT::K*CtaTileT::N];
 
     for(int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K)
     {
@@ -71,63 +71,60 @@ __global__ void gemm(GemmParams params)
         // 256 threads load 256 x 16 tile A from global memory
         // Each thread load a stipe of 1x16 
         int localTid = threadIdx.x * blockDim.y + threadIdx.y;
+
         int offsetM = blockIdx.x * CtaTileT::M + localTid;
-        for(int k=0; k < CtaTileT::K/4; k++)
+        for(int k=0; k < CtaTileT::K; k+=1)
         {
             // Assuming A is row major
-            int64_t addrA = offsetM * params.K + (ctaK + k*4);
-            *reinterpret_cast<float4*>(&tileA[localTid][k*4]) = *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrA)[addrA]);
+           int64_t addrA = offsetM * params.K + (ctaK + k);
+           tileA[k*CtaTileT::M+localTid] = reinterpret_cast<float*>(params.ptrA)[addrA];
         }
 
         // 256 threads load 16 x 256 tile B from global memory
-        // Each thread load a stipe of 1x16 by vector load
-        //          16 ele     |  --16 ele  |--------------
-        //  row 0 | ---- T0----  --- T1 --- .... ---T15----
-        //  row 1 | ---- T6----  ----T17-----....----T31---
-        //   ...
-        //  row 15
-
-        int row = localTid / 16;
-        int col = localTid % 16;
-        int offsetK = row;
-        for(int k=0; k < CtaTileT::K/4; k++)
+        // Each thread load a stipe of 16x1
+        int offsetN = blockIdx.y * CtaTileT::N + localTid;
+        for(int k=0; k < CtaTileT::K; k+=4)
         {
-           int offsetN = blockIdx.y * CtaTileT::N+ 16*col + k*4;
-           int addrB = (ctaK + offsetK)  * params.N + offsetN;
-           *reinterpret_cast<float4*>(&tileB[offsetK][16*col+k*4]) = *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrB)[addrB]);
+           for(int ik=0; ik<4; ++ik)
+           {
+               int addrB = (ctaK + k+ik)  * params.N + offsetN;
+               tileB[(k+ik)*CtaTileT::N+localTid] = reinterpret_cast<float*>(params.ptrB)[addrB];
+           }
         }
 
         //2. sync cta
         __syncthreads();
 
-        constexpr int InstructionM = 8;
-        constexpr int InstructionN = 8;
+        constexpr int InstructionM = 4;
+        constexpr int InstructionN = 4;
         //3. do shmem gemm by all threds in this CTA
 
-        // 32/8
-        for(int instructM =0; instructM < ThreadTileT::M; instructM += InstructionM)
+        for(int threadK = 0; threadK < CtaTileT::K; ++threadK)
         {
-            // 8/8
-            for(int instructN = 0; instructN < ThreadTileT::N; instructN += InstructionN)
+            static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
+            // 32/8
+            for(int instructM =0; instructM < ThreadTileT::M; instructM += InstructionM)
             {
-                for(int threadK = 0; threadK < CtaTileT::K; ++threadK)
+                // 8/8
+                for(int instructN = 0; instructN < ThreadTileT::N; instructN += InstructionN)
                 {
                     float fragementA [InstructionM];
                     float fragementB [InstructionN];
-                    static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
 
                     // fragment A = load A from shmem
                     // fragment B = load B from shmem
                     int offsetM = threadIdx.x * ThreadTileT::M + instructM;
                     for(int m = 0; m < InstructionM; m++)
                     {
-                        fragementA[m] = tileA[offsetM+m][threadK];
+                        int shmemA = threadK * CtaTileT::M + offsetM+m;
+                        fragementA[m] = tileA[shmemA];
                     }
 
                     int offsetN = threadIdx.y * ThreadTileT::N + instructN;
                     for(int n = 0; n < InstructionN; n++)
                     {
-                       fragementB[n] = tileB[threadK][offsetN+n];
+                       int shmemB= threadK * CtaTileT::N + offsetN+n;
+                       fragementB[n] = tileB[shmemB];
                     }
 
                     for(int m = 0; m < InstructionM; m++)
@@ -193,8 +190,8 @@ int main()
 
     // All fixed.
     using CtaTileShape = CtaTile<256, 256, 16>;
-    using ThreadTileShape = ThreadTile<32, 8, 1>;
-    dim3 block = {8, 32};
+    using ThreadTileShape = ThreadTile<16, 16, 1>;
+    dim3 block = {16, 16};
 
     dim3 grid = {divUp(M, CtaTileShape::M), divUp(N, CtaTileShape::N), 1};
 
