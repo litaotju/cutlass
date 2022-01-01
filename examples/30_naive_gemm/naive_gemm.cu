@@ -75,11 +75,17 @@ __global__ void gemm(GemmParams params)
         int localTid = threadIdx.x * blockDim.y + threadIdx.y;
 
         int offsetM = blockIdx.x * CtaTileT::M + localTid;
-        for(int k=0; k < CtaTileT::K; k+=1)
+
+        for(int k=0; k < CtaTileT::K/4; k+=1)
         {
+            alignas(sizeof(float4)) float xa[4];
+            int64_t addrA = offsetM * params.K + ctaK + k*4;
+            *reinterpret_cast<float4*>(&xa[0]) = *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrA)[addrA]);
             // Assuming A is row major
-           int64_t addrA = offsetM * params.K + (ctaK + k);
-           tileA[k*CtaTileT::M+localTid] = reinterpret_cast<float*>(params.ptrA)[addrA];
+            for(int ik=0; ik < 4; ++ik)
+            {
+                tileA[(k*4+ik) *CtaTileT::M+localTid] = reinterpret_cast<float*>(&xa)[ik];
+            }
         }
 
         // 256 threads load 16 x 256 tile B from global memory
