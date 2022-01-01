@@ -114,18 +114,12 @@ __global__ void gemm(GemmParams params)
                     // fragment A = load A from shmem
                     // fragment B = load B from shmem
                     int offsetM = MmaTileM*(instructM * blockDim.x + threadIdx.x);
-                    for(int m = 0; m < MmaTileM; m++)
-                    {
-                        int shmemA = threadK * CtaTileT::M + offsetM+m;
-                        fragementA[m] = tileA[shmemA];
-                    }
+                    int shmemA = threadK * CtaTileT::M + offsetM;
+                    *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&tileA[shmemA]);
 
                     int offsetN = MmaTileN*(instructN * blockDim.y +  threadIdx.y); 
-                    for(int n = 0; n < MmaTileN; n++)
-                    {
-                       int shmemB= threadK * CtaTileT::N + offsetN+n;
-                       fragementB[n] = tileB[shmemB];
-                    }
+                    int shmemB= threadK * CtaTileT::N + offsetN;
+                    *reinterpret_cast<float4*>(&fragementB[0]) = *reinterpret_cast<float4*>(&tileB[shmemB]);
 
                     for(int m = 0; m < MmaTileM; m++)
                     {
@@ -159,13 +153,13 @@ __global__ void gemm(GemmParams params)
             auto _offsetN = offsetN + MmaTileN*(instructN * blockDim.y +  threadIdx.y); 
             for(int m = 0; m < MmaTileM; m++)
             {
-                for(int n=0; n < MmaTileN; n++)
-                {
-                    auto x = accmulator[instructM*MmaTileM+m][instructN*MmaTileN+n];
-                    x = params.alpha * x + params.beta;
-                    int globalOffsetD = (_offsetM+m) * params.N + _offsetN +n;
-                    reinterpret_cast<float*>(params.ptrD)[globalOffsetD] = x;
-                }
+                float4 x = *reinterpret_cast<float4*>(&accmulator[instructM*MmaTileM+m][instructN*MmaTileN]);
+                x.x = params.alpha * x.x + params.beta;
+                x.y = params.alpha * x.y + params.beta;
+                x.z = params.alpha * x.z + params.beta;
+                x.w = params.alpha * x.w + params.beta;
+                int globalOffsetD = (_offsetM+m) * params.N + _offsetN;
+               *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrD)[globalOffsetD]) = x;
             }
         }
     }
