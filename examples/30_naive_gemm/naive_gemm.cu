@@ -72,35 +72,29 @@ __global__ void gemm(GemmParams params)
         // Each thread load a stipe of 1x16 
         int localTid = threadIdx.x * blockDim.y + threadIdx.y;
         int offsetM = blockIdx.x * CtaTileT::M + localTid;
-        for(int k=0; k < CtaTileT::K; k++)
+        for(int k=0; k < CtaTileT::K/4; k++)
         {
             // Assuming A is row major
-            int64_t addrA = offsetM * params.K + (ctaK + k);
-            if(offsetM >= params.M || ctaK+k >= params.K)
-            {
-                tileA[localTid][k] = 0;
-                assert(false);
-            }
-            else
-            {
-                tileA[localTid][k] = reinterpret_cast<float*>(params.ptrA)[addrA];
-            }
+            int64_t addrA = offsetM * params.K + (ctaK + k*4);
+            *reinterpret_cast<float4*>(&tileA[localTid][k*4]) = *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrA)[addrA]);
         }
 
         // 256 threads load 16 x 256 tile B from global memory
-        int offsetN = blockIdx.y * CtaTileT::N + localTid;
-        for(int k=0; k < CtaTileT::K; k++)
+        // Each thread load a stipe of 1x16 by vector load
+        //          16 ele     |  --16 ele  |--------------
+        //  row 0 | ---- T0----  --- T1 --- .... ---T15----
+        //  row 1 | ---- T6----  ----T17-----....----T31---
+        //   ...
+        //  row 15
+
+        int row = localTid / 16;
+        int col = localTid % 16;
+        int offsetK = row;
+        for(int k=0; k < CtaTileT::K/4; k++)
         {
-            // Assuming B is row major
-            if(ctaK +k  >= params.K ||  offsetN >= params.N)
-            {
-                tileB[k][localTid] = 0;
-            }
-            else
-            {
-                int addrB = (ctaK + k) * params.N + offsetN;
-                tileB[k][localTid] = reinterpret_cast<float*>(params.ptrB)[addrB];
-            }
+           int offsetN = blockIdx.y * CtaTileT::N+ 16*col + k*4;
+           int addrB = (ctaK + offsetK)  * params.N + offsetN;
+           *reinterpret_cast<float4*>(&tileB[offsetK][16*col+k*4]) = *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrB)[addrB]);
         }
 
         //2. sync cta
