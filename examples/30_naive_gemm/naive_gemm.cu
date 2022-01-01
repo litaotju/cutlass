@@ -67,41 +67,39 @@ __global__ void gemm(GemmParams params)
     for(int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K)
     {
         //1. load A, B to shmem by all threads in this CTA
-        if(threadIdx.x == 0 && threadIdx.y == 0)
+
+        // 256 threads load 256 x 16 tile A from global memory
+        // Each thread load a stipe of 1x16 
+        int localTid = threadIdx.x * blockDim.y + threadIdx.y;
+        int offsetM = blockIdx.x * CtaTileT::M + localTid;
+        for(int k=0; k < CtaTileT::K; k++)
         {
-            int offsetM = blockIdx.x * CtaTileT::M;
-            int offsetN = blockIdx.y * CtaTileT::N;
-            for(int m=0; m < CtaTileT::M; m++)
+            // Assuming A is row major
+            int64_t addrA = offsetM * params.K + (ctaK + k);
+            if(offsetM >= params.M || ctaK+k >= params.K)
             {
-                for(int k=0; k < CtaTileT::K; k++)
-                {
-                    // Assuming A is row major
-                    int addrA = (offsetM + m) * params.K + (ctaK + k);
-                    if(offsetM + m >= params.M || ctaK+k >= params.K)
-                    {
-                        tileA[m][k] = 0;
-                    }
-                    else
-                    {
-                        tileA[m][k] = reinterpret_cast<float*>(params.ptrA)[addrA];
-                    }
-                }
+                tileA[localTid][k] = 0;
+                assert(false);
             }
-            for(int k=0; k < CtaTileT::K; k++)
+            else
             {
-                for(int n=0; n < CtaTileT::N; n++)
-                {
-                    // Assuming B is row major
-                    if(ctaK +k  >= params.K ||  offsetN + n >= params.N)
-                    {
-                        tileB[k][n] = 0;
-                    }
-                    else
-                    {
-                        int addrB = (ctaK + k) * params.N + offsetN + n;
-                        tileB[k][n] = reinterpret_cast<float*>(params.ptrB)[addrB];
-                    }
-                }
+                tileA[localTid][k] = reinterpret_cast<float*>(params.ptrA)[addrA];
+            }
+        }
+
+        // 256 threads load 16 x 256 tile B from global memory
+        int offsetN = blockIdx.y * CtaTileT::N + localTid;
+        for(int k=0; k < CtaTileT::K; k++)
+        {
+            // Assuming B is row major
+            if(ctaK +k  >= params.K ||  offsetN >= params.N)
+            {
+                tileB[k][localTid] = 0;
+            }
+            else
+            {
+                int addrB = (ctaK + k) * params.N + offsetN;
+                tileB[k][localTid] = reinterpret_cast<float*>(params.ptrB)[addrB];
             }
         }
 
@@ -154,6 +152,8 @@ __global__ void gemm(GemmParams params)
                 }
             }
         }
+        //This is essential, otherwise, some threads will override the shared memory while other ones using it
+        __syncthreads();
     };
 
     int offsetM = blockIdx.x * CtaTileT::M + threadIdx.x * ThreadTileT::M;
@@ -209,21 +209,24 @@ int main()
     CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(float), cudaMemcpyDeviceToHost));
 
     CutlassSgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N);
+    CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(float), cudaMemcpyDeviceToHost));
 
-    bool eq = std::equal(hC.begin(), hC.end(), hRefC.begin(), 
-        [](float a, float b) { 
+    bool hasErr = false;
+    for(int i=0; i < hC.size(); ++i)
+    {
 #if DEBUG
-            printf("a: %f, b: %f\n", a, b);
+        printf("i %d: a: %f, b: %f\n", i, a, b);
 #endif
-            auto const err = std::abs(a-b);
-            if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
-            {
-                printf("a: %f, b: %f\n", a, b);
-                return false;
-            }
-            return true;
-        });
-    printf(eq ? "Check Pass\n" : "Check Error\n");
-    return !eq;
+        auto a = hC[i];
+        auto b = hRefC[i];
+        auto const err = std::abs(a-b);
+        if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
+        {
+            printf("i %d: Result: %f, Ref: %f\n", i, a, b);
+            hasErr = true;
+        }
+    }
+    printf(hasErr ? "Check Error\n" : "Check Pass\n");
+    return hasErr;
 }
