@@ -109,33 +109,33 @@ __global__ void gemm(GemmParams params)
     {
         //1. load A, B to shmem by all threads in this CTA
 
-        // 256 threads load 256 x 16 tile A from global memory
-        // Each thread load a stipe of 1x16 
+        // 256 threads load 128 x 16 tile A from global memory
+        // Each thread load a stipe of 1x8
         int const &localTid = threadIdx.x;
 
-        int offsetM = blockIdx.x * CtaTileT::M + localTid;
+        int offsetM = blockIdx.x * CtaTileT::M + localTid/2;
 
-        for(int k=0; k < CtaTileT::K/4; k+=1)
+        for(int k=0; k < 8; k+=4)
         {
-            int64_t addrA = offsetM * params.K + ctaK + k*4;
+            int64_t addrA = offsetM * params.K + ctaK+(localTid%2)*8+k;
             *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrA)[addrA]);
             // Assuming A is row major
             for(int ik=0; ik < 4; ++ik)
             {
-                tileA[(k*4+ik) *CtaTileT::M+localTid] = fragementA[ik];
+                tileA[((localTid%2)*8+k+ik) *CtaTileT::M+localTid/2] = fragementA[ik];
             }
         }
 
-        // 256 threads load 16 x 256 tile B from global memory
-        // Each thread load a stipe of 16x1
-        int offsetN = blockIdx.y * CtaTileT::N + localTid;
-        for(int k=0; k < CtaTileT::K; k+=4)
+        // 256 threads load 16 x 128 tile B from global memory
+        // Each thread load a stipe of 8x1
+        int offsetN = blockIdx.y * CtaTileT::N + localTid%128;
+        for(int k=0; k < 8; k+=4)
         {
            for(int ik=0; ik<4; ++ik)
            {
-               int addrB = (ctaK+k+ik)  * params.N + offsetN;
+               int addrB = (ctaK+ (localTid/128)*8+k+ik)  * params.N + offsetN;
                fragementB[ik] =  reinterpret_cast<float*>(params.ptrB)[addrB];
-               tileB[(k+ik)*CtaTileT::N+localTid] = fragementB[ik] ;
+               tileB[((localTid/128)*8+ k+ik)*CtaTileT::N+localTid%128] = fragementB[ik] ;
            }
         }
 
@@ -213,8 +213,8 @@ int main()
     GemmParams params {M, N, K, A, B, C, C, alpha, beta};
 
     // All fixed.
-    using CtaTileShape = CtaTile<256, 256, 16>;
-    using ThreadTileShape = ThreadTile<16, 16, 1>;
+    using CtaTileShape = CtaTile<128, 128, 16>;
+    using ThreadTileShape = ThreadTile<8, 8, 1>;
     dim3 block = {256};
 
     dim3 grid = {divUp(M, CtaTileShape::M), divUp(N, CtaTileShape::N), 1};
