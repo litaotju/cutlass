@@ -61,10 +61,39 @@ __global__ void gemm(GemmParams params)
         }
     }
 
+    int const ctaStartM = blockIdx.x * CtaTileT::M;
+    int const ctaStartN = blockIdx.y * CtaTileT::N;
+
+    // 8 wrap: 2 x 4;
+    int warpId = threadIdx.x / 32;
+    int laneId = threadIdx.x % 32;
+
+    assert(blockDim.x == 256);
+    constexpr int NUM_WARPS = 8; // blockDim.x/32;
+    constexpr int WRAP_ROW = 2;
+    constexpr int WRAP_COL = 4;
+    constexpr int WARP_TILE_M = CtaTileT::M/WRAP_ROW;
+    constexpr int WARP_TILE_N = CtaTileT::N/WRAP_COL; 
+
+    const int wrapStartM = (warpId / 4) * WARP_TILE_M;
+    const int wrapStartN = (warpId % 4) * WARP_TILE_N;
+
+    // 1 wrap computes: 128 * 64 elements
+    // 1 thread computes 16 * 16 elements
+    // this makes the thread structure
+    //  8 * 4
+    const int rowInsideWarp = laneId / 4;
+    const int colInsideWarp = laneId % 4; 
+    const int threadStartM = wrapStartM + rowInsideWarp * ThreadTileT::M;
+    const int threadStartN = wrapStartN + colInsideWarp * ThreadTileT::N;
+
     constexpr int MmaTileM = 4;
     constexpr int MmaTileN = 4;
     __shared__ float tileA [CtaTileT::K*CtaTileT::M];
     __shared__ float tileB [CtaTileT::K*CtaTileT::N];
+
+    alignas(sizeof(float4)) float fragementA[MmaTileM];
+    alignas(sizeof(float4)) float fragementB[MmaTileN];
 
     for(int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K)
     {
@@ -72,7 +101,7 @@ __global__ void gemm(GemmParams params)
 
         // 256 threads load 256 x 16 tile A from global memory
         // Each thread load a stipe of 1x16 
-        int localTid = threadIdx.x * blockDim.y + threadIdx.y;
+        int const &localTid = threadIdx.x;
 
         int offsetM = blockIdx.x * CtaTileT::M + localTid;
 
@@ -108,36 +137,19 @@ __global__ void gemm(GemmParams params)
         for(int threadK = 0; threadK < CtaTileT::K; ++threadK)
         {
             static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
-            // 32/8
-            for(int instructM =0; instructM < ThreadTileT::M/MmaTileM; instructM += 1)
+            for(int m = 0; m < ThreadTileT::M; m+=MmaTileM)
             {
-                // 8/8
-                for(int instructN = 0; instructN < ThreadTileT::N/MmaTileN; instructN += 1)
+                *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&tileA[threadK*CtaTileT::M + threadStartM + m]);
+                for(int n = 0; n < ThreadTileT::N; n+=MmaTileN)
                 {
-                    alignas(sizeof(float4)) float fragementA [MmaTileM];
-                    alignas(sizeof(float4)) float fragementB [MmaTileN];
-
-                    // fragment A = load A from shmem
-                    // fragment B = load B from shmem
-                    int offsetM = MmaTileM*(instructM * blockDim.x + threadIdx.x);
-                    int shmemA = threadK * CtaTileT::M + offsetM;
-                    *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&tileA[shmemA]);
-
-                    int offsetN = MmaTileN*(instructN * blockDim.y +  threadIdx.y); 
-                    int shmemB= threadK * CtaTileT::N + offsetN;
-                    *reinterpret_cast<float4*>(&fragementB[0]) = *reinterpret_cast<float4*>(&tileB[shmemB]);
-
-                    for(int m = 0; m < MmaTileM; m++)
+                    *reinterpret_cast<float4*>(&fragementB[0]) = *reinterpret_cast<float4*>(&tileB[threadK*CtaTileT::N + threadStartN + n]);
+                    #pragma unroll MmaTileM
+                    for(int i=0; i < MmaTileM; ++i)
                     {
-                        for(int n=0; n < MmaTileN; n++)
+                        #pragma unroll MmaTileN
+                        for(int j=0; j < MmaTileN; ++j)
                         {
-                            accmulator[instructM*MmaTileM+m][instructN*MmaTileN+n] += fragementA[m]* fragementB[n];
-#if DEBUG
-                            if(blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 && threadIdx.y == 0)
-                            {
-                                CUDA_LOG("accumlator[%d][%d] %f\n", m, n, accmulator[m][n]);
-                            }
-#endif
+                            accmulator[m+i][n+j] += fragementA[i]*fragementB[j] ;
                         }
                     }
                 }
@@ -147,30 +159,21 @@ __global__ void gemm(GemmParams params)
         __syncthreads();
     };
 
-    int offsetM = blockIdx.x * CtaTileT::M;
-    int offsetN = blockIdx.y * CtaTileT::N;
 
     // D = alpha * C + beta
-    for(int instructM =0; instructM < ThreadTileT::M/MmaTileM; instructM += 1)
+    for(int m=0; m< ThreadTileT::M; m+= 1)
     {
-        for(int instructN = 0; instructN < ThreadTileT::N/MmaTileN; instructN += 1)
+        for(int n= 0; n< ThreadTileT::N; n+=MmaTileN)
         {
-            auto _offsetM = offsetM + MmaTileM*(instructM * blockDim.x + threadIdx.x);
-            auto _offsetN = offsetN + MmaTileN*(instructN * blockDim.y +  threadIdx.y); 
-            for(int m = 0; m < MmaTileM; m++)
-            {
-                float4 x = *reinterpret_cast<float4*>(&accmulator[instructM*MmaTileM+m][instructN*MmaTileN]);
-                x.x = params.alpha * x.x + params.beta;
-                x.y = params.alpha * x.y + params.beta;
-                x.z = params.alpha * x.z + params.beta;
-                x.w = params.alpha * x.w + params.beta;
-                int globalOffsetD = (_offsetM+m) * params.N + _offsetN;
-               *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrD)[globalOffsetD]) = x;
-            }
+            float4 &x = *reinterpret_cast<float4*>(&accmulator[m][n]);
+            x.x = params.alpha * x.x + params.beta;
+            x.y = params.alpha * x.y + params.beta;
+            x.z = params.alpha * x.z + params.beta;
+            x.w = params.alpha * x.w + params.beta;
+            int globalOffsetD = (ctaStartM + threadStartM +m) * params.N + ctaStartN + threadStartN + n;
+            *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrD)[globalOffsetD]) = x;
         }
     }
-
-
 }
 
 
@@ -199,7 +202,7 @@ int main()
     // All fixed.
     using CtaTileShape = CtaTile<256, 256, 16>;
     using ThreadTileShape = ThreadTile<16, 16, 1>;
-    dim3 block = {16, 16};
+    dim3 block = {256};
 
     dim3 grid = {divUp(M, CtaTileShape::M), divUp(N, CtaTileShape::N), 1};
 
@@ -222,7 +225,7 @@ int main()
         auto const err = std::abs(a-b);
         if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
         {
-            printf("i %d: Result: %f, Ref: %f\n", i, a, b);
+            // printf("i %d: Result: %f, Ref: %f\n", i, a, b);
             hasErr = true;
         }
     }
