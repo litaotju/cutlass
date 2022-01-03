@@ -191,8 +191,12 @@ int main()
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
-    // All fixed.
-    CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N);
+#if 0
+    // cutlass Tensor core gemm has some bug here???
+    CUDA_PERROR(CutlassHgemmTT_TensorCore(M, N, K, alpha, reinterpret_cast<cutlass::half_t const*>(A), K, 
+                 reinterpret_cast<cutlass::half_t const*>(B), N, beta,  reinterpret_cast<cutlass::half_t*>(RefC), N));
+#endif
+    CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N));
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
@@ -207,7 +211,7 @@ int main()
         auto const err = std::abs(a-b);
         if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
         {
-            // printf("i %d: Result: %f, Ref: %f\n", i, a, b);
+            printf("i %d: Result: %f, Ref: %f\n", i, a, b);
             hasErr = true;
         }
     }
