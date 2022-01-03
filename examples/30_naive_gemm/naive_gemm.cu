@@ -84,11 +84,16 @@ __global__ void gemm(GemmParams params)
     //  8 * 4
     const int rowInsideWarp = laneId / 4;
     const int colInsideWarp = laneId % 4; 
-    const int threadStartM = wrapStartM + rowInsideWarp * ThreadTileT::M;
-    const int threadStartN = wrapStartN + colInsideWarp * ThreadTileT::N;
-
     constexpr int MmaTileM = 4;
     constexpr int MmaTileN = 4;
+
+    const int threadStartM = wrapStartM + rowInsideWarp * MmaTileM;
+    const int threadStartN = wrapStartN + colInsideWarp * MmaTileN;
+
+    const int threadStrideM = WARP_TILE_M/(ThreadTileT::M/MmaTileM);
+    const int threadStrideN = WARP_TILE_N/(ThreadTileT::N/MmaTileN);
+
+
     __shared__ float tileA [CtaTileT::K*CtaTileT::M];
     __shared__ float tileB [CtaTileT::K*CtaTileT::N];
 
@@ -137,19 +142,19 @@ __global__ void gemm(GemmParams params)
         for(int threadK = 0; threadK < CtaTileT::K; ++threadK)
         {
             static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
-            for(int m = 0; m < ThreadTileT::M; m+=MmaTileM)
+            for(int m = 0; m < ThreadTileT::M/MmaTileM; m+=1)
             {
-                *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&tileA[threadK*CtaTileT::M + threadStartM + m]);
-                for(int n = 0; n < ThreadTileT::N; n+=MmaTileN)
+                *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&tileA[threadK*CtaTileT::M + threadStartM + m*threadStrideM]);
+                for(int n = 0; n < ThreadTileT::N/MmaTileN; n+=1)
                 {
-                    *reinterpret_cast<float4*>(&fragementB[0]) = *reinterpret_cast<float4*>(&tileB[threadK*CtaTileT::N + threadStartN + n]);
+                    *reinterpret_cast<float4*>(&fragementB[0]) = *reinterpret_cast<float4*>(&tileB[threadK*CtaTileT::N + threadStartN + n*threadStrideN]);
                     #pragma unroll MmaTileM
                     for(int i=0; i < MmaTileM; ++i)
                     {
                         #pragma unroll MmaTileN
                         for(int j=0; j < MmaTileN; ++j)
                         {
-                            accmulator[m+i][n+j] += fragementA[i]*fragementB[j] ;
+                            accmulator[m*MmaTileM+i][n*MmaTileN+j] += fragementA[i]*fragementB[j] ;
                         }
                     }
                 }
@@ -161,17 +166,20 @@ __global__ void gemm(GemmParams params)
 
 
     // D = alpha * C + beta
-    for(int m=0; m< ThreadTileT::M; m+= 1)
+    for(int m=0; m< ThreadTileT::M/MmaTileM; m+= 1)
     {
-        for(int n= 0; n< ThreadTileT::N; n+=MmaTileN)
+        for(int n= 0; n< ThreadTileT::N/MmaTileN; n+=1)
         {
-            float4 &x = *reinterpret_cast<float4*>(&accmulator[m][n]);
-            x.x = params.alpha * x.x + params.beta;
-            x.y = params.alpha * x.y + params.beta;
-            x.z = params.alpha * x.z + params.beta;
-            x.w = params.alpha * x.w + params.beta;
-            int globalOffsetD = (ctaStartM + threadStartM +m) * params.N + ctaStartN + threadStartN + n;
-            *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrD)[globalOffsetD]) = x;
+            for(int i=0; i < MmaTileM; ++i)
+            {
+                float4 &x = *reinterpret_cast<float4*>(&accmulator[m*MmaTileM+i][n*MmaTileN]);
+                x.x = params.alpha * x.x + params.beta;
+                x.y = params.alpha * x.y + params.beta;
+                x.z = params.alpha * x.z + params.beta;
+                x.w = params.alpha * x.w + params.beta;
+                int globalOffsetD = (ctaStartM + threadStartM + m*threadStrideM+i) * params.N + ctaStartN + threadStartN + n*threadStrideN;
+                *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrD)[globalOffsetD]) = x;
+            }
         }
     }
 }
