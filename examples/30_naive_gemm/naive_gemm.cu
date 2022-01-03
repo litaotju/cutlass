@@ -70,20 +70,25 @@ __global__ void gemm(GemmParams params)
 
     assert(blockDim.x == 256);
     constexpr int NUM_WARPS = 8; // blockDim.x/32;
-    constexpr int WRAP_ROW = 2;
-    constexpr int WRAP_COL = 4;
-    constexpr int WARP_TILE_M = CtaTileT::M/WRAP_ROW;
-    constexpr int WARP_TILE_N = CtaTileT::N/WRAP_COL; 
+    constexpr int WARP_ROW = 2;
+    constexpr int WARP_COL = 4;
+    constexpr int WARP_TILE_M = CtaTileT::M/WARP_ROW;
+    constexpr int WARP_TILE_N = CtaTileT::N/WARP_COL; 
 
-    const int wrapStartM = (warpId / 4) * WARP_TILE_M;
-    const int wrapStartN = (warpId % 4) * WARP_TILE_N;
+    const int wrapStartM = (warpId / WARP_COL) * WARP_TILE_M;
+    const int wrapStartN = (warpId % WARP_COL) * WARP_TILE_N;
 
     // 1 wrap computes: 128 * 64 elements
+
     // 1 thread computes 16 * 16 elements
     // this makes the thread structure
     //  8 * 4
-    const int rowInsideWarp = laneId / 4;
-    const int colInsideWarp = laneId % 4; 
+    constexpr int THREADS_ROW = WARP_TILE_M/ ThreadTileT::M;
+    constexpr int THREADS_COL = WARP_TILE_N/ ThreadTileT::N;
+    static_assert(THREADS_ROW * THREADS_COL == 32, "A warp has 32 threads only");
+
+    const int rowInsideWarp = laneId / THREADS_COL ;
+    const int colInsideWarp = laneId % THREADS_COL; 
     constexpr int MmaTileM = 4;
     constexpr int MmaTileN = 4;
 
