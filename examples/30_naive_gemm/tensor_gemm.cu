@@ -1,12 +1,8 @@
-#include <algorithm>
-#include <cstdio>
 #include "cutlass_gemm.h"
 #include "cutlass/util/debug.h"
-#include <exception>
+
 #include <vector>
-
-
-#define DEBUG 0
+#include <cstdio>
 
 // D = alpha * (A @ B + C) + beta
 // @ means matric multiply
@@ -17,7 +13,8 @@ __global__ void gemm(GemmParams params)
     {
         return;
     }
-    alignas(sizeof(float4)) float accmulator [ThreadTileT::M][ThreadTileT::N];
+
+    half accmulator [ThreadTileT::M][ThreadTileT::N];
 
     // TODO: load accumlator init from C, assume C = 0 for now
     for(int m=0; m<ThreadTileT::M; ++m)
@@ -66,11 +63,11 @@ __global__ void gemm(GemmParams params)
     constexpr int threadStrideN = WARP_TILE_N/(ThreadTileT::N/MmaTileN);
 
 
-    __shared__ float tileA [CtaTileT::K*CtaTileT::M];
-    __shared__ float tileB [CtaTileT::K*CtaTileT::N];
+    __shared__ half tileA [CtaTileT::K*CtaTileT::M];
+    __shared__ half tileB [CtaTileT::K*CtaTileT::N];
 
-    alignas(sizeof(float4)) float fragementA[MmaTileM];
-    alignas(sizeof(float4)) float fragementB[MmaTileN];
+    half fragementA[MmaTileM];
+    half fragementB[MmaTileN];
 
     for(int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K)
     {
@@ -84,11 +81,11 @@ __global__ void gemm(GemmParams params)
 
         for(int k=0; k < 8; k+=4)
         {
-            int64_t addrA = offsetM * params.K + ctaK+(localTid%2)*8+k;
-            *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrA)[addrA]);
             // Assuming A is row major
             for(int ik=0; ik < 4; ++ik)
             {
+                int64_t addrA = offsetM * params.K + ctaK+(localTid%2)*8+k + ik;
+                fragementA[ik] = reinterpret_cast<half*>(params.ptrA)[addrA];
                 tileA[((localTid%2)*8+k+ik) *CtaTileT::M+localTid/2] = fragementA[ik];
             }
         }
@@ -101,7 +98,7 @@ __global__ void gemm(GemmParams params)
            for(int ik=0; ik<4; ++ik)
            {
                int addrB = (ctaK+ (localTid/128)*8+k+ik)  * params.N + offsetN;
-               fragementB[ik] =  reinterpret_cast<float*>(params.ptrB)[addrB];
+               fragementB[ik] =  reinterpret_cast<half*>(params.ptrB)[addrB];
                tileB[((localTid/128)*8+ k+ik)*CtaTileT::N+localTid%128] = fragementB[ik] ;
            }
         }
@@ -116,10 +113,15 @@ __global__ void gemm(GemmParams params)
             static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
             for(int m = 0; m < ThreadTileT::M/MmaTileM; m+=1)
             {
-                *reinterpret_cast<float4*>(&fragementA[0]) = *reinterpret_cast<float4*>(&tileA[threadK*CtaTileT::M + threadStartM + m*threadStrideM]);
+                for(int ii=0; ii < MmaTileM; ++ii)
+                {
+                    fragementA[ii] = tileA[threadK*CtaTileT::M + threadStartM + m*threadStrideM + ii];
+                }
+
                 for(int n = 0; n < ThreadTileT::N/MmaTileN; n+=1)
                 {
-                    *reinterpret_cast<float4*>(&fragementB[0]) = *reinterpret_cast<float4*>(&tileB[threadK*CtaTileT::N + threadStartN + n*threadStrideN]);
+                    for(int jj=0; jj < MmaTileN; ++jj)
+                        fragementB[jj] = tileB[threadK*CtaTileT::N + threadStartN + n*threadStrideN + jj];
                     #pragma unroll MmaTileM
                     for(int i=0; i < MmaTileM; ++i)
                     {
@@ -144,31 +146,30 @@ __global__ void gemm(GemmParams params)
         {
             for(int i=0; i < MmaTileM; ++i)
             {
-                *reinterpret_cast<float4*>(&fragementB[0]) = *reinterpret_cast<float4*>(&accmulator[m*MmaTileM+i][n*MmaTileN]);
                 for(int j=0; j < MmaTileN; ++j )
                 {
-                    fragementB[j] = params.alpha * fragementB[j] + params.beta;
+                    fragementB[j] = accmulator[m*MmaTileM+i][n*MmaTileN+j];
+                    fragementB[j] = fromFloat<half>(params.alpha * toFloat(fragementB[j]) + params.beta);
+                    int globalOffsetD = (ctaStartM + threadStartM + m*threadStrideM+i) * params.N + ctaStartN + threadStartN + n*threadStrideN+j;
+                    reinterpret_cast<half*>(params.ptrD)[globalOffsetD] = fragementB[j];
                 }
-                int globalOffsetD = (ctaStartM + threadStartM + m*threadStrideM+i) * params.N + ctaStartN + threadStartN + n*threadStrideN;
-                *reinterpret_cast<float4*>(&reinterpret_cast<float*>(params.ptrD)[globalOffsetD]) = *reinterpret_cast<float4*>(&fragementB[0]);
             }
         }
     }
 }
-
 
 int main()
 {
     int M = 4096;
     int N = 4096;
     int K = 256;
-    float *A ;
-    float *B ;
-    float *C ;
-    float *RefC ;
+    half *A ;
+    half *B ;
+    half *C ;
+    half *RefC ;
 
-    std::vector<float> hC (M*N, 0);
-    std::vector<float> hRefC (M*N, -1);
+    std::vector<half> hC (M*N, 0);
+    std::vector<half> hRefC (M*N, -1);
 
     CUDA_PERROR(AllocateMatrix(&A, M, K, 10));
     CUDA_PERROR(AllocateMatrix(&B, K, N, 101));
@@ -188,11 +189,12 @@ int main()
 
     gemm<CtaTileShape, ThreadTileShape> <<<grid, block, 0>>>(params);
     CUDA_PERROR(cudaDeviceSynchronize());
-    CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
-    CutlassSgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N);
+    // All fixed.
+    CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N);
     CUDA_PERROR(cudaDeviceSynchronize());
-    CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
     bool hasErr = false;
     for(int i=0; i < hC.size(); ++i)
@@ -200,8 +202,8 @@ int main()
 #if DEBUG
         printf("i %d: a: %f, b: %f\n", i, a, b);
 #endif
-        auto a = hC[i];
-        auto b = hRefC[i];
+        auto a = toFloat(hC[i]);
+        auto b = toFloat(hRefC[i]);
         auto const err = std::abs(a-b);
         if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
         {
