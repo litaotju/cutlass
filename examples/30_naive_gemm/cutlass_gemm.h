@@ -207,7 +207,7 @@ cudaError_t CutlassHgemmTT_TensorCore(
   using MMAOp = cutlass::arch::OpClassTensorOp;
 
   // This code section describes CUDA SM architecture number
-  using SmArch = cutlass::arch::Sm75;
+  using SmArch = cutlass::arch::Sm70;
 
   // This code section describes the tile size a thread block will compute
   using ShapeMMAThreadBlock =
@@ -334,7 +334,7 @@ __global__ void InitializeMatrix_kernel(
     int const k = 16807;
     int const m = 16;
     float value = float(((offset + seed) * k % m) - m / 2);
-
+    if(offset %  7==0 || offset % 3 ==0) value = 0;
     matrix[offset] = fromFloat<T>(value);
   }
 }

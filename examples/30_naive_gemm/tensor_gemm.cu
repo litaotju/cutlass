@@ -177,6 +177,7 @@ int main()
     CUDA_PERROR(AllocateMatrix(&RefC, M, N, 103));
 
     float alpha = 1;
+    //TODO: non-zero value will fail the ref check? Why
     float beta = 0;
     GemmParams params {M, N, K, A, B, C, C, alpha, beta};
 
@@ -191,12 +192,14 @@ int main()
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
-#if 0
+#if 1
     // cutlass Tensor core gemm has some bug here???
     CUDA_PERROR(CutlassHgemmTT_TensorCore(M, N, K, alpha, reinterpret_cast<cutlass::half_t const*>(A), K, 
                  reinterpret_cast<cutlass::half_t const*>(B), N, beta,  reinterpret_cast<cutlass::half_t*>(RefC), N));
-#endif
+#else
     CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N));
+#endif
+
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
