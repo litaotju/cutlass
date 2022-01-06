@@ -1,8 +1,11 @@
 #include "cutlass_gemm.h"
 #include "cutlass/util/debug.h"
+#include "mma.h"
 
 #include <vector>
 #include <cstdio>
+
+using namespace nvcuda;
 
 // D = alpha * (A @ B + C) + beta
 // @ means matric multiply
@@ -14,60 +17,46 @@ __global__ void gemm(GemmParams params)
         return;
     }
 
-    half accmulator [ThreadTileT::M][ThreadTileT::N];
-
-    // TODO: load accumlator init from C, assume C = 0 for now
-    for(int m=0; m<ThreadTileT::M; ++m)
-    {
-        for(int n=0; n<ThreadTileT::N; ++n)
-        {
-            accmulator[m][n] = 0;
-        }
-    }
-
     int const ctaStartM = blockIdx.x * CtaTileT::M;
     int const ctaStartN = blockIdx.y * CtaTileT::N;
 
     // 8 wrap: 2 x 4;
     int warpId = threadIdx.x / 32;
-    int laneId = threadIdx.x % 32;
-
     assert(blockDim.x == 256);
     constexpr int NUM_WARPS = 8; // blockDim.x/32;
     constexpr int WARP_ROW = 2;
     constexpr int WARP_COL = 4;
-    constexpr int WARP_TILE_M = CtaTileT::M/WARP_ROW;
-    constexpr int WARP_TILE_N = CtaTileT::N/WARP_COL; 
+    constexpr int WARP_TILE_M = CtaTileT::M/WARP_ROW; // 128/2 = 64
+    constexpr int WARP_TILE_N = CtaTileT::N/WARP_COL; // 128/4 = 32
 
     const int wrapStartM = (warpId / WARP_COL) * WARP_TILE_M;
     const int wrapStartN = (warpId % WARP_COL) * WARP_TILE_N;
 
-    // 1 wrap computes: 128 * 64 elements
-
-    // 1 thread computes 16 * 16 elements
-    // this makes the thread structure
-    //  8 * 4
-    constexpr int THREADS_ROW = WARP_TILE_M/ ThreadTileT::M;
-    constexpr int THREADS_COL = WARP_TILE_N/ ThreadTileT::N;
-    static_assert(THREADS_ROW * THREADS_COL == 32, "A warp has 32 threads only");
-
-    const int rowInsideWarp = laneId / THREADS_COL ;
-    const int colInsideWarp = laneId % THREADS_COL; 
     constexpr int MmaTileM = 4;
     constexpr int MmaTileN = 4;
-
-    const int threadStartM = wrapStartM + rowInsideWarp * MmaTileM;
-    const int threadStartN = wrapStartN + colInsideWarp * MmaTileN;
-
-    constexpr int threadStrideM = WARP_TILE_M/(ThreadTileT::M/MmaTileM);
-    constexpr int threadStrideN = WARP_TILE_N/(ThreadTileT::N/MmaTileN);
-
 
     __shared__ half tileA [CtaTileT::K*CtaTileT::M];
     __shared__ half tileB [CtaTileT::K*CtaTileT::N];
 
     half fragementA[MmaTileM];
     half fragementB[MmaTileN];
+
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
+
+    // Initialize the output to zero
+    for(int m = 0; m < WARP_TILE_M/WMMA_M ; ++m)
+    {
+        for(int n = 0; n < WARP_TILE_N/WMMA_N; ++n)
+        {
+            wmma::fill_fragment(c_frag[m][n], 0);
+        }
+    }
 
     for(int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K)
     {
@@ -107,53 +96,32 @@ __global__ void gemm(GemmParams params)
         __syncthreads();
 
         //3. do shmem gemm by all threds in this CTA
-
-        for(int threadK = 0; threadK < CtaTileT::K; ++threadK)
+        static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
+        for(int m = 0; m < WARP_TILE_M/WMMA_M; m+=1)
         {
-            static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
-            for(int m = 0; m < ThreadTileT::M/MmaTileM; m+=1)
+            for(int n = 0; n < WARP_TILE_N/WMMA_N; n+=1)
             {
-                for(int ii=0; ii < MmaTileM; ++ii)
-                {
-                    fragementA[ii] = tileA[threadK*CtaTileT::M + threadStartM + m*threadStrideM + ii];
-                }
-
-                for(int n = 0; n < ThreadTileT::N/MmaTileN; n+=1)
-                {
-                    for(int jj=0; jj < MmaTileN; ++jj)
-                        fragementB[jj] = tileB[threadK*CtaTileT::N + threadStartN + n*threadStrideN + jj];
-                    #pragma unroll MmaTileM
-                    for(int i=0; i < MmaTileM; ++i)
-                    {
-                        #pragma unroll MmaTileN
-                        for(int j=0; j < MmaTileN; ++j)
-                        {
-                            accmulator[m*MmaTileM+i][n*MmaTileN+j] += fragementA[i]*fragementB[j] ;
-                        }
-                    }
-                }
+                
+                // Load the inputs
+                wmma::load_matrix_sync(a_frag[m][n], &tileA[wrapStartM + WMMA_M*m], CtaTileT::M);
+                wmma::load_matrix_sync(b_frag[m][n], &tileB[wrapStartN + WMMA_N*n], CtaTileT::N);
+                // Perform the matrix multiplication
+                wmma::mma_sync(c_frag[m][n], a_frag[m][n], b_frag[m][n], c_frag[m][n]);
             }
         }
         //This is essential, otherwise, some threads will override the shared memory while other ones using it
         __syncthreads();
     };
 
-
     // D = alpha * C + beta
-    for(int m=0; m< ThreadTileT::M/MmaTileM; m+= 1)
+    for(int m=0; m< WARP_TILE_M/WMMA_M; m+= 1)
     {
-        for(int n= 0; n< ThreadTileT::N/MmaTileN; n+=1)
+        for(int n= 0; n< WARP_TILE_N/WMMA_N; n+=1)
         {
-            for(int i=0; i < MmaTileM; ++i)
-            {
-                for(int j=0; j < MmaTileN; ++j )
-                {
-                    fragementB[j] = accmulator[m*MmaTileM+i][n*MmaTileN+j];
-                    fragementB[j] = fromFloat<half>(params.alpha * toFloat(fragementB[j]) + params.beta);
-                    int globalOffsetD = (ctaStartM + threadStartM + m*threadStrideM+i) * params.N + ctaStartN + threadStartN + n*threadStrideN+j;
-                    reinterpret_cast<half*>(params.ptrD)[globalOffsetD] = fragementB[j];
-                }
-            }
+            int globalOffsetM = ctaStartM + wrapStartM  + WMMA_M * m;
+            int globalOffsetN = ctaStartN + wrapStartN  + WMMA_N * n;
+            auto c = reinterpret_cast<half*>(params.ptrD) + globalOffsetM * params.N + globalOffsetN;
+            wmma::store_matrix_sync(c, c_frag[m][n], params.N, wmma::mem_row_major);
         }
     }
 }
