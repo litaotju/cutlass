@@ -45,8 +45,8 @@ __global__ void gemm(GemmParams params)
     constexpr int WMMA_N = 16;
     constexpr int WMMA_K = 16;
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag[2];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[2];
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
 
     // Initialize the output to zero
@@ -97,16 +97,25 @@ __global__ void gemm(GemmParams params)
 
         //3. do shmem gemm by all threds in this CTA
         static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
+
+        wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM], CtaTileT::M);
+        wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN], CtaTileT::N);
         for(int m = 0; m < WARP_TILE_M/WMMA_M; m+=1)
         {
+            // if(m < WARP_TILE_M/WARP_TILE_M-1)
+            // {
+            //     wmma::load_matrix_sync(a_frag[(m+1)%2], &tileA[wrapStartM + WMMA_M*(m+1)], CtaTileT::M);
+            // }
+            wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM + WMMA_M*m], CtaTileT::M);
             for(int n = 0; n < WARP_TILE_N/WMMA_N; n+=1)
             {
-                
                 // Load the inputs
-                wmma::load_matrix_sync(a_frag[m][n], &tileA[wrapStartM + WMMA_M*m], CtaTileT::M);
-                wmma::load_matrix_sync(b_frag[m][n], &tileB[wrapStartN + WMMA_N*n], CtaTileT::N);
+                if( n < WARP_TILE_N/ WMMA_N-1)
+                {
+                    wmma::load_matrix_sync(b_frag[(n+1)%2], &tileB[wrapStartN + WMMA_N*(n+1)], CtaTileT::N);
+                }
                 // Perform the matrix multiplication
-                wmma::mma_sync(c_frag[m][n], a_frag[m][n], b_frag[m][n], c_frag[m][n]);
+                wmma::mma_sync(c_frag[m][n], a_frag[0], b_frag[n%2], c_frag[m][n]);
             }
         }
         //This is essential, otherwise, some threads will override the shared memory while other ones using it
