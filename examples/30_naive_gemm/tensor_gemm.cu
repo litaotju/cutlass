@@ -38,17 +38,18 @@ __global__ void gemm(GemmParams params)
     __shared__ half tileA [CtaTileT::K*CtaTileT::M];
     __shared__ half tileB [CtaTileT::K*CtaTileT::N];
 
-    half fragementA[MmaTileM];
-    half fragementB[MmaTileN];
+    alignas(8*sizeof(half)) half fragementA[8];
+    alignas(8*sizeof(half)) half fragementB[MmaTileN];
 
     constexpr int WMMA_M = 16;
     constexpr int WMMA_N = 16;
     constexpr int WMMA_K = 16;
 
-    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> a_frag[2];
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[2];
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[2];
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
 
+    static_assert(WMMA_K == CtaTileT::K, "Current implementation does not support WMMA_K != CtaTile::K yet");
     // Initialize the output to zero
     for(int m = 0; m < WARP_TILE_M/WMMA_M ; ++m)
     {
@@ -68,16 +69,10 @@ __global__ void gemm(GemmParams params)
 
         int offsetM = blockIdx.x * CtaTileT::M + localTid/2;
 
-        for(int k=0; k < 8; k+=4)
-        {
-            // Assuming A is row major
-            for(int ik=0; ik < 4; ++ik)
-            {
-                int64_t addrA = offsetM * params.K + ctaK+(localTid%2)*8+k + ik;
-                fragementA[ik] = reinterpret_cast<half*>(params.ptrA)[addrA];
-                tileA[((localTid%2)*8+k+ik) *CtaTileT::M+localTid/2] = fragementA[ik];
-            }
-        }
+        // Assuming A is row major
+        int64_t addrA = offsetM * params.K + ctaK+(localTid%2)*8;
+        *reinterpret_cast<uint4*>(&fragementA[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(params.ptrA)[addrA]);
+        *reinterpret_cast<uint4*>(&tileA[(localTid/2)*CtaTileT::K + ((localTid%2)*8)]) = *reinterpret_cast<uint4*>(&fragementA[0]);
 
         // 256 threads load 16 x 128 tile B from global memory
         // Each thread load a stipe of 8x1
@@ -98,13 +93,13 @@ __global__ void gemm(GemmParams params)
         //3. do shmem gemm by all threds in this CTA
         static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
 
-        wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM], CtaTileT::M);
+        wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM*CtaTileT::K], CtaTileT::K);
         wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN], CtaTileT::N);
         for(int m = 0; m < WARP_TILE_M/WMMA_M; m+=1)
         {
             if(m < WARP_TILE_M/WMMA_M-1)
             {
-                wmma::load_matrix_sync(a_frag[(m+1)%2], &tileA[wrapStartM + WMMA_M*(m+1)], CtaTileT::M);
+                wmma::load_matrix_sync(a_frag[(m+1)%2], &tileA[(wrapStartM + WMMA_M*(m+1))*CtaTileT::K], CtaTileT::K);
             }
             for(int n = 0; n < WARP_TILE_N/WMMA_N; n+=1)
             {
