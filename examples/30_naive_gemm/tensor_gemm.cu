@@ -32,14 +32,11 @@ __global__ void gemm(GemmParams params)
     const int wrapStartM = (warpId / WARP_COL) * WARP_TILE_M;
     const int wrapStartN = (warpId % WARP_COL) * WARP_TILE_N;
 
-    constexpr int MmaTileM = 4;
-    constexpr int MmaTileN = 4;
-
     __shared__ half tileA [CtaTileT::K*CtaTileT::M];
     __shared__ half tileB [CtaTileT::K*CtaTileT::N];
 
     alignas(8*sizeof(half)) half fragementA[8];
-    alignas(8*sizeof(half)) half fragementB[MmaTileN];
+    alignas(8*sizeof(half)) half fragementB[8];
 
     constexpr int WMMA_M = 16;
     constexpr int WMMA_N = 16;
@@ -63,29 +60,24 @@ __global__ void gemm(GemmParams params)
     {
         //1. load A, B to shmem by all threads in this CTA
 
-        // 256 threads load 128 x 16 tile A from global memory
-        // Each thread load a stipe of 1x8
         int const &localTid = threadIdx.x;
 
         int offsetM = blockIdx.x * CtaTileT::M + localTid/2;
 
         // Assuming A is row major
+        // 256 threads load 128 x 16 tile A from global memory
+        // Each thread load a stipe of 1x8 (128 bits), this makes the threads inside a block structed as 128 x 2
         int64_t addrA = offsetM * params.K + ctaK+(localTid%2)*8;
         *reinterpret_cast<uint4*>(&fragementA[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(params.ptrA)[addrA]);
         *reinterpret_cast<uint4*>(&tileA[(localTid/2)*CtaTileT::K + ((localTid%2)*8)]) = *reinterpret_cast<uint4*>(&fragementA[0]);
 
+        // Assuming B is row major
         // 256 threads load 16 x 128 tile B from global memory
-        // Each thread load a stipe of 8x1
-        int offsetN = blockIdx.y * CtaTileT::N + localTid%128;
-        for(int k=0; k < 8; k+=4)
-        {
-           for(int ik=0; ik<4; ++ik)
-           {
-               int addrB = (ctaK+ (localTid/128)*8+k+ik)  * params.N + offsetN;
-               fragementB[ik] =  reinterpret_cast<half*>(params.ptrB)[addrB];
-               tileB[((localTid/128)*8+ k+ik)*CtaTileT::N+localTid%128] = fragementB[ik] ;
-           }
-        }
+        // Each thread load a stipe of 1x8 (128 bits), this make the threads inside a block structured as: 16 x 16
+        int offsetN = blockIdx.y * CtaTileT::N + (localTid%16)*8;
+        int addrB = (ctaK+ (localTid/16))  * params.N + offsetN;
+        *reinterpret_cast<uint4*>(&fragementB[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(params.ptrB)[addrB]);
+        *reinterpret_cast<uint4*>(&tileB[(localTid/16)*CtaTileT::N+(localTid%16)*8]) = *reinterpret_cast<uint4*>(&fragementB[0]) ;
 
         //2. sync cta
         __syncthreads();
