@@ -32,8 +32,8 @@ __global__ void gemm(GemmParams params)
     const int wrapStartM = (warpId / WARP_COL) * WARP_TILE_M;
     const int wrapStartN = (warpId % WARP_COL) * WARP_TILE_N;
 
-    __shared__ half tileA [CtaTileT::K*CtaTileT::M];
-    __shared__ half tileB [CtaTileT::K*CtaTileT::N];
+    __shared__ half tileA [CtaTileT::M*CtaTileT::K];
+    __shared__ half tileB [CtaTileT::N*CtaTileT::K];
 
     alignas(8*sizeof(half)) half fragementA[8];
     alignas(8*sizeof(half)) half fragementB[8];
@@ -43,7 +43,7 @@ __global__ void gemm(GemmParams params)
     constexpr int WMMA_K = 16;
 
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[2];
-    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> b_frag[2];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[2];
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[WARP_TILE_M/WMMA_M][WARP_TILE_N/WMMA_N];
 
     static_assert(WMMA_K == CtaTileT::K, "Current implementation does not support WMMA_K != CtaTile::K yet");
@@ -74,10 +74,15 @@ __global__ void gemm(GemmParams params)
         // Assuming B is row major
         // 256 threads load 16 x 128 tile B from global memory
         // Each thread load a stipe of 1x8 (128 bits), this make the threads inside a block structured as: 16 x 16
-        int offsetN = blockIdx.y * CtaTileT::N + (localTid%16)*8;
-        int addrB = (ctaK+ (localTid/16))  * params.N + offsetN;
+        //!!!! Note: thread row = tid % 16 , col = tid / 16, this reduced the number of bank conflicts
+        //!!!!       do not use row = tid / 16, col = tid % 16, since the tile B in shmem is NxK.
+        int offsetN = blockIdx.y * CtaTileT::N + (localTid/16)*8;
+        int addrB = (ctaK+ (localTid%16))  * params.N + offsetN;
         *reinterpret_cast<uint4*>(&fragementB[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(params.ptrB)[addrB]);
-        *reinterpret_cast<uint4*>(&tileB[(localTid/16)*CtaTileT::N+(localTid%16)*8]) = *reinterpret_cast<uint4*>(&fragementB[0]) ;
+        for(int i=0; i < sizeof(fragementB)/sizeof(half); ++i)
+        {
+            tileB[((localTid/16)*8 + i)*CtaTileT::K + (localTid%16)] = fragementB[i] ;
+        }
 
         //2. sync cta
         __syncthreads();
@@ -86,7 +91,7 @@ __global__ void gemm(GemmParams params)
         static_assert(ThreadTileT::K ==  1, "Only support ThreadTile::K ==1 for now");
 
         wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM*CtaTileT::K], CtaTileT::K);
-        wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN], CtaTileT::N);
+        wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN*CtaTileT::K], CtaTileT::K);
         for(int m = 0; m < WARP_TILE_M/WMMA_M; m+=1)
         {
             if(m < WARP_TILE_M/WMMA_M-1)
@@ -98,7 +103,7 @@ __global__ void gemm(GemmParams params)
                 // Load the inputs
                 if( n < WARP_TILE_N/ WMMA_N-1)
                 {
-                    wmma::load_matrix_sync(b_frag[(n+1)%2], &tileB[wrapStartN + WMMA_N*(n+1)], CtaTileT::N);
+                    wmma::load_matrix_sync(b_frag[(n+1)%2], &tileB[(wrapStartN + WMMA_N*(n+1))*CtaTileT::K], CtaTileT::K);
                 }
                 // Perform the matrix multiplication
                 wmma::mma_sync(c_frag[m][n], a_frag[m%2], b_frag[n%2], c_frag[m][n]);
