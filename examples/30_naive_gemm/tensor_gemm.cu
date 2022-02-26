@@ -81,6 +81,61 @@ __global__ void gemm_use_cutlass_apis(GemmParams params)
 }
 #endif // 0
 
+enum class Layout: int32_t
+{
+    RowMajor,
+    ColMajor
+};
+
+#ifdef __CUDACC__
+#define HOST_DEVICE __host__ __device__
+#else
+#define HOST_DEVICE
+#endif
+
+template<typename T, int R, int C>
+class Matrix
+{
+public:
+
+    HOST_DEVICE Matrix(T* memory, Layout layout):
+        mMemory(memory), mLayout(layout)
+    {
+        if(layout == Layout::RowMajor)
+        {
+            mStrides[0] = C;
+            mStrides[1] = 1;
+        }
+        else
+        {
+            mStrides[0] = 1;
+            mStrides[1] = R;
+        }
+    }
+
+    HOST_DEVICE T& at(int r, int c)
+    {
+        return mMemory[r*mStrides[0] + c*mStrides[1]];
+    }
+    HOST_DEVICE Layout layout() const
+    {
+        return mLayout;
+    }
+private:
+    //!
+    //! TODO: only support packed layout for now, publish this ctor and support non packed layout
+    //!
+    HOST_DEVICE Matrix(T* memory, int64_t strides[2]):
+            mMemory(memory), mLayout(Layout::RowMajor)
+    {
+        mStrides[0]  = strides[0];
+        mStrides[1]  = strides[1];
+    }
+    T* mMemory;
+    Layout mLayout;
+    int64_t mStrides[2];
+};
+
 //!
 //! GlobalMemoryIterator
 //!     A thread block collectively load a tile from global memory to registers, using vector load
@@ -112,48 +167,54 @@ public:
         int y;
     };
 
-    static constexpr int accessPerRow = blockSizeC/VectorSize; // 16/8 == 2, or 128/8 == 16
-    static constexpr int kIteration = blockSizeR / (Threads / accessPerRow); // 128 / (256/2) == 1, or 16/(256/16) == 1
+    static_assert(blockSizeC % VectorSize == 0 && "Global memory is raw major, elements in a row must be divided by vector size");
+    static_assert((blockSizeR*blockSizeC/VectorSize) % Threads == 0 && "The matrix must be able to equally parted by threads");
+
+    static constexpr int kIteration = blockSizeR * (blockSizeC / VectorSize) / Threads; // 128 / (256/2) == 1, or 16/(256/16) == 1
     static_assert(kIteration == 1 && "Only support 1 iteration now");
-    static constexpr int ThreadsCols = accessPerRow; // 2 or 16
+
+    static constexpr int ThreadsCols = blockSizeC / VectorSize; // 2 or 16
     static constexpr int ThreadsRows = Threads / ThreadsCols ; // 256 / 2 = 128, or 256/16 = 16
+    static_assert(std::is_same<T, half>::value);
+    static_assert(VectorSize*sizeof(T)*8 == 128);
+
+    using MatrixType = Matrix<T, blockSizeR, blockSizeC>;
 
     using Fragment =  T[VectorSize];
-    __device__ GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address):
+    HOST_DEVICE GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address):
         mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}
     {
-        int64_t blockStart = (blockOffset.x + threadMajor()) * lda + blockOffset.y;
-        mThreadStart = blockStart+(threadMinor())*VectorSize;
+        //TODO: this assumes the global matrix is row major(A: MxK, B: KxN), add a variant to column major
+        mThreadStart = (blockOffset.x + row()) * lda + blockOffset.y+col()*VectorSize;
     }
 
-    __device__ void load(Fragment& fragment)
+    HOST_DEVICE void load(Fragment& fragment)
     {
         *reinterpret_cast<uint4*>(&fragment[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[mThreadStart]);
     }
 
-    __device__ void storeA(Fragment &fragment, T *shmem, int ldm)
+    HOST_DEVICE void store(Fragment &fragment, MatrixType& dstMatrix)
     {
-        // m * K + k
-        int shmemAddressA = threadMajor() * ldm + threadMinor() * VectorSize;
-        *reinterpret_cast<uint4 *>(&shmem[shmemAddressA]) = *reinterpret_cast<uint4 *>(&fragment[0]);
-    }
-
-    __device__ void storeB(Fragment &fragment, T *shmem, int ldm)
-    {
-        for(int i=0; i < VectorSize; ++i)
+        if(dstMatrix.layout() == Layout::RowMajor)
         {
-            // n * K + k
-            int shmemAddressB = (threadMinor() * VectorSize + i) * ldm + threadMajor() ;
-            shmem[shmemAddressB] = fragment[i];
+            auto &dst = dstMatrix.at(row(), col()*VectorSize);
+            *reinterpret_cast<uint4 *>(&dst) = *reinterpret_cast<uint4 *>(&fragment[0]);
+        }
+        else
+        {
+            for(int i=0; i < VectorSize; ++i)
+            {
+                dstMatrix.at(row(), col()*VectorSize+i) = fragment[i];
+            }
         }
     }
 
 private:
-    __device__ int threadMajor()
+    HOST_DEVICE int row()
     {
         return ThreadMapRowMajor ?  mTid/ThreadsCols : mTid% ThreadsRows;
     }
-    __device__ int threadMinor() {
+    HOST_DEVICE int col() {
         return ThreadMapRowMajor ?  mTid%ThreadsCols : mTid/ ThreadsRows;
     }
     int mTid;
@@ -192,6 +253,8 @@ __global__ void gemm(GemmParams params) {
     using IteratorA = GloablMemoryIterator<BlockSize, CtaTileT::M, CtaTileT::K, half, VectorSize>;
     using IteratorB = GloablMemoryIterator<BlockSize, CtaTileT::K, CtaTileT::N, half, VectorSize, false/*ThreadMapRowMajor*/>;
 
+    typename  IteratorA::MatrixType matrixA_shared(&tileA[0], Layout::RowMajor);
+    typename  IteratorB::MatrixType matrixB_shared(&tileB[0], Layout::ColMajor);
     alignas(MemoryAccessBits/8) typename IteratorA::Fragment fragementA;
     alignas(MemoryAccessBits/8) typename IteratorB::Fragment fragementB;
 
@@ -221,14 +284,14 @@ __global__ void gemm(GemmParams params) {
         // Each thread load a stipe of 1x8 (128 bits), this makes the threads inside a block structed as 128 x 2
         IteratorA iteratorA(threadIdx.x, {blockIdx.x * CtaTileT::M, ctaK}, params.lda, params.ptrA);
         iteratorA.load(fragementA);
-        iteratorA.storeA(fragementA, tileA, CtaTileT::K);
+        iteratorA.store(fragementA, matrixA_shared);
 
         // Assuming B is row major
         // 256 threads load 16 x 128 tile B from global memory
         // Each thread load a stipe of 1x8 (128 bits), this make the threads inside a block structured as: 16 x 16
         IteratorB iteratorB(threadIdx.x, {ctaK, blockIdx.y * CtaTileT::N}, params.ldb, params.ptrB);
         iteratorB.load(fragementB);
-        iteratorB.storeB(fragementB, tileB, CtaTileT::K);
+        iteratorB.store(fragementB, matrixB_shared);
 
         //2. sync cta
         __syncthreads();
