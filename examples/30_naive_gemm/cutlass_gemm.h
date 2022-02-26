@@ -19,6 +19,8 @@ struct GemmParams
     void *ptrD; 
     float alpha;
     float beta;
+    int lda;
+    int ldb;
 };
 
 template<int M_, int N_, int K_>

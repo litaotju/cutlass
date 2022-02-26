@@ -1,11 +1,120 @@
 #include "cutlass_gemm.h"
 #include "cutlass/util/debug.h"
+#include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 #include "mma.h"
 
 #include <vector>
 #include <cstdio>
 
 using namespace nvcuda;
+
+#if 0
+template<typename CtaTileT, typename ThreadTileT>
+__global__ void gemm_use_cutlass_apis(GemmParams params)
+{
+    if(blockIdx.x >= divUp (params.M, CtaTileT::M) || blockIdx.y >= divUp(params.N, CtaTileT::N))
+    {
+        return;
+    }
+
+    int const ctaStartM = blockIdx.x * CtaTileT::M;
+    int const ctaStartN = blockIdx.y * CtaTileT::N;
+
+    // 8 wrap: 2 x 4;
+    int warpId = threadIdx.x / 32;
+    assert(blockDim.x == 256);
+    constexpr int NUM_WARPS = 8; // blockDim.x/32;
+    constexpr int WARP_ROW = 2;
+    constexpr int WARP_COL = 4;
+    constexpr int WARP_TILE_M = CtaTileT::M/WARP_ROW; // 128/2 = 64
+    constexpr int WARP_TILE_N = CtaTileT::N/WARP_COL; // 128/4 = 32
+
+    const int wrapStartM = (warpId / WARP_COL) * WARP_TILE_M;
+    const int wrapStartN = (warpId % WARP_COL) * WARP_TILE_N;
+
+    __shared__ half tileA [CtaTileT::M*CtaTileT::K];
+    __shared__ half tileB [CtaTileT::N*CtaTileT::K];
+
+    using ShapeA = cutlass::layout::PitchLinearShape<CtaTileT::K, CtaTileT::M>;
+    using ShapeB = cutlass::layout::PitchLinearShape<CtaTileT::N, CtaTileT::K>;
+    using Layout = cutlass::layout::PitchLinear;
+    using Element = cutlass::half_t;
+    static int const kThreads = 32;
+    using ThreadMapA = cutlass::transform::PitchLinearStripminedThreadMap<ShapeA, kThreads>;
+    using ThreadMapB = cutlass::transform::PitchLinearStripminedThreadMap<ShapeB, kThreads>;
+
+    using IteratorA = cutlass::transform::threadblock::PredicatedTileIterator<
+        ShapeA, Element, Layout, 0/*A is Row Major, advance over continous K*/, ThreadMapA>;
+    typename IteratorA::Params paramsA(params.K);
+    typename IteratorA::Fragment shmem_fragementA;
+    cutlass::MatrixCoord tbOffsetA{ctaStartM, 0};
+    IteratorA iteratorA(paramsA, reinterpret_cast<Element*>(params.ptrA), cutlass::make_Coord(params.M, params.K), threadIdx.x, tbOffsetA);
+    shmem_fragementA.clear();
+    iteratorA.load(shmem_fragementA);
+
+    using IteratorB = cutlass::transform::threadblock::PredicatedTileIterator<
+        ShapeB, Element, Layout, 1/*B is Row major, advance over strided K*/, ThreadMapB>;
+    typename IteratorB::Params paramsB(CtaTileT::K);
+    typename IteratorB::Fragment shmem_fragementB;
+    cutlass::MatrixCoord tbOffsetB{0, ctaStartN};
+    IteratorB iteratorB(paramsB, reinterpret_cast<Element*>(params.ptrB), cutlass::make_Coord(params.K, params.N), threadIdx.x, tbOffsetB);
+    shmem_fragementB.clear();
+    iteratorB.load(shmem_fragementB);
+    ++iteratorA;
+    ++iteratorB;
+
+    for(int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K)
+    {
+        //2. sync cta
+        __syncthreads();
+
+        //3. do shmem gemm by all threds in this CTA
+
+        //This is essential, otherwise, some threads will override the shared memory while other ones using it
+        __syncthreads();
+        iteratorA.load(shmem_fragementA);
+        iteratorB.load(shmem_fragementB);
+        ++iteratorA;
+        ++iteratorB;
+    };
+
+}
+#endif // 0
+
+//!Assume it's row major
+template<int Threads, int blockSizeR, int blockSizeC, typename T, int VectorSize, bool ThreadMapRowMajor = true>
+class GloablMemoryIterator
+{
+public:
+    struct Coords
+    {
+        int x;
+        int y;
+    };
+
+    static constexpr int accessPerRow = blockSizeC/VectorSize; // 16/8 == 2, or 128/8 == 16
+    static constexpr int iteration = blockSizeR / (Threads / accessPerRow); // 128 / (256/2) == 1, or 16/(256/16) == 1
+    static_assert(iteration == 1 && "Only support 1 iteration now");
+    static constexpr int ThreadsCols = accessPerRow; // 2 or 16
+    static constexpr int ThreadsRows = Threads / ThreadsCols ; // 256 / 2 = 128, or 256/16 = 16
+
+    using Fragment = T[VectorSize];
+    __device__ GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address)
+    {
+        int threadMajor = ThreadMapRowMajor ?  threadId/ThreadsCols : threadId % ThreadsRows;
+        int threadMinor = ThreadMapRowMajor ?  threadId%ThreadsCols : threadId / ThreadsRows;
+        int64_t blockStart = (blockOffset.x + threadMajor) * lda + blockOffset.y;
+        mThreadStart = blockStart+(threadMinor)*VectorSize;
+        mAddress = reinterpret_cast<T*>(address);
+    }
+
+    __device__ void load(Fragment& fragment)
+    {
+        *reinterpret_cast<uint4*>(&fragment[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[mThreadStart]);
+    }
+    int64_t mThreadStart;
+    T* mAddress;
+};
 
 // D = alpha * (A @ B + C) + beta
 // @ means matric multiply
@@ -56,32 +165,38 @@ __global__ void gemm(GemmParams params)
         }
     }
 
+
     for(int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K)
     {
         //1. load A, B to shmem by all threads in this CTA
-
         int const &localTid = threadIdx.x;
-
-        int offsetM = blockIdx.x * CtaTileT::M + localTid/2;
 
         // Assuming A is row major
         // 256 threads load 128 x 16 tile A from global memory
         // Each thread load a stipe of 1x8 (128 bits), this makes the threads inside a block structed as 128 x 2
-        int64_t addrA = offsetM * params.K + ctaK+(localTid%2)*8;
-        *reinterpret_cast<uint4*>(&fragementA[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(params.ptrA)[addrA]);
-        *reinterpret_cast<uint4*>(&tileA[(localTid/2)*CtaTileT::K + ((localTid%2)*8)]) = *reinterpret_cast<uint4*>(&fragementA[0]);
+        constexpr int VectorSize = 8;
+        using IteratorA = GloablMemoryIterator<256, 128, 16, half, VectorSize>;
+        IteratorA iteratorA(threadIdx.x, {blockIdx.x*CtaTileT::M, ctaK}, params.lda, params.ptrA);
+        iteratorA.load(fragementA);
+        int shmemAddressA = (localTid/IteratorA::ThreadsCols)*CtaTileT::K +((localTid% IteratorA::ThreadsCols)*VectorSize);
+        *reinterpret_cast<uint4*>(&tileA[shmemAddressA]) = *reinterpret_cast<uint4*>(&fragementA[0]);
+
 
         // Assuming B is row major
         // 256 threads load 16 x 128 tile B from global memory
         // Each thread load a stipe of 1x8 (128 bits), this make the threads inside a block structured as: 16 x 16
-        //!!!! Note: thread row = tid % 16 , col = tid / 16, this reduced the number of bank conflicts
+        //!!!!
+        //!!!! TODO: change to thread row = tid % 16 , col = tid / 16, this reduced the number of bank conflicts
         //!!!!       do not use row = tid / 16, col = tid % 16, since the tile B in shmem is NxK.
-        int offsetN = blockIdx.y * CtaTileT::N + (localTid/16)*8;
-        int addrB = (ctaK+ (localTid%16))  * params.N + offsetN;
-        *reinterpret_cast<uint4*>(&fragementB[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(params.ptrB)[addrB]);
+        //!!!!
+        using IteratorB = GloablMemoryIterator<256, 16, 128, half, VectorSize, false/*ThreadMapRowMajor*/>;
+        IteratorB  iteratorB(threadIdx.x, {ctaK, blockIdx.y*CtaTileT::N}, params.ldb, params.ptrB);
+        iteratorB.load(fragementB);
+
         for(int i=0; i < sizeof(fragementB)/sizeof(half); ++i)
         {
-            tileB[((localTid/16)*8 + i)*CtaTileT::K + (localTid%16)] = fragementB[i] ;
+            int shmemAddressB = ((localTid/IteratorB::ThreadsRows)*VectorSize + i)*CtaTileT::K + (localTid%IteratorB::ThreadsRows);
+            tileB[shmemAddressB] = fragementB[i] ;
         }
 
         //2. sync cta
@@ -286,7 +401,7 @@ int main()
     float alpha = 1;
     //TODO: non-zero value will fail the ref check? Why
     float beta = 0;
-    GemmParams params {M, N, K, A, B, C, C, alpha, beta};
+    GemmParams params {M, N, K, A, B, C, C, alpha, beta, K, N};
 
     // All fixed.
     using CtaTileShape = CtaTile<128, 128, 16>;
@@ -296,7 +411,7 @@ int main()
     dim3 grid = {divUp(M, CtaTileShape::M), divUp(N, CtaTileShape::N), 1};
 
     gemm<CtaTileShape, ThreadTileShape> <<<grid, block, 0>>>(params);
-    gemm_double_buffer_shmem<CtaTileShape, ThreadTileShape> <<<grid, block, 0>>>(params);
+//    gemm_double_buffer_shmem<CtaTileShape, ThreadTileShape> <<<grid, block, 0>>>(params);
 
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(half), cudaMemcpyDeviceToHost));
