@@ -39,6 +39,14 @@ struct ThreadTile
     static constexpr int K = K_;
 };
 
+template<int M_, int N_, int K_>
+struct WarpTile
+{
+    static constexpr int M = M_;
+    static constexpr int N = N_;
+    static constexpr int K = K_;
+};
+
 inline __host__ __device__ int divUp(int a, int b)
 {
     return (a+b-1)/b;
