@@ -81,7 +81,27 @@ __global__ void gemm_use_cutlass_apis(GemmParams params)
 }
 #endif // 0
 
-//!Assume it's row major
+//!
+//! GlobalMemoryIterator
+//!     A thread block collectively load a tile from global memory to registers, using vector load
+//!
+//! \tparam Threads : the number of threads participate in this collectively load
+//! \tparam blockSizeR : block size in row
+//! \tparam blockSizeC : block size in column
+//! \tparam T : element type
+//! \tparam VectorSize : the number of scalar (T) per Vector, one memory access is loading one Vector
+//! \tparam ThreadMapRowMajor : how to arrange the threads
+//!       For example, RowMajor 16x16 means the threads are arranged like follows:
+//              0  1  2 ... 15
+//              16 17 18 ... 31
+//              .. ...      ...
+//              240 ..       255
+//        ColMajor( ThreadMapRowMajor = false), 16x16 means threads are arrange like the follows:
+//               0  16 32 ..  240
+//               1  17 ...    241
+//               2  .. ... .. 242
+//               .. .. ...... ..
+//               15 .. ...... 255
 template<int Threads, int blockSizeR, int blockSizeC, typename T, int VectorSize, bool ThreadMapRowMajor = true>
 class GloablMemoryIterator
 {
@@ -93,27 +113,52 @@ public:
     };
 
     static constexpr int accessPerRow = blockSizeC/VectorSize; // 16/8 == 2, or 128/8 == 16
-    static constexpr int iteration = blockSizeR / (Threads / accessPerRow); // 128 / (256/2) == 1, or 16/(256/16) == 1
-    static_assert(iteration == 1 && "Only support 1 iteration now");
+    static constexpr int kIteration = blockSizeR / (Threads / accessPerRow); // 128 / (256/2) == 1, or 16/(256/16) == 1
+    static_assert(kIteration == 1 && "Only support 1 iteration now");
     static constexpr int ThreadsCols = accessPerRow; // 2 or 16
     static constexpr int ThreadsRows = Threads / ThreadsCols ; // 256 / 2 = 128, or 256/16 = 16
 
-    using Fragment = T[VectorSize];
-    __device__ GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address)
+    using Fragment =  T[VectorSize];
+    __device__ GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address):
+        mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}
     {
-        int threadMajor = ThreadMapRowMajor ?  threadId/ThreadsCols : threadId % ThreadsRows;
-        int threadMinor = ThreadMapRowMajor ?  threadId%ThreadsCols : threadId / ThreadsRows;
-        int64_t blockStart = (blockOffset.x + threadMajor) * lda + blockOffset.y;
-        mThreadStart = blockStart+(threadMinor)*VectorSize;
-        mAddress = reinterpret_cast<T*>(address);
+        int64_t blockStart = (blockOffset.x + threadMajor()) * lda + blockOffset.y;
+        mThreadStart = blockStart+(threadMinor())*VectorSize;
     }
 
     __device__ void load(Fragment& fragment)
     {
         *reinterpret_cast<uint4*>(&fragment[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[mThreadStart]);
     }
-    int64_t mThreadStart;
+
+    __device__ void storeA(Fragment &fragment, T *shmem, int ldm)
+    {
+        // m * K + k
+        int shmemAddressA = threadMajor() * ldm + threadMinor() * VectorSize;
+        *reinterpret_cast<uint4 *>(&shmem[shmemAddressA]) = *reinterpret_cast<uint4 *>(&fragment[0]);
+    }
+
+    __device__ void storeB(Fragment &fragment, T *shmem, int ldm)
+    {
+        for(int i=0; i < VectorSize; ++i)
+        {
+            // n * K + k
+            int shmemAddressB = (threadMinor() * VectorSize + i) * ldm + threadMajor() ;
+            shmem[shmemAddressB] = fragment[i];
+        }
+    }
+
+private:
+    __device__ int threadMajor()
+    {
+        return ThreadMapRowMajor ?  mTid/ThreadsCols : mTid% ThreadsRows;
+    }
+    __device__ int threadMinor() {
+        return ThreadMapRowMajor ?  mTid%ThreadsCols : mTid/ ThreadsRows;
+    }
+    int mTid;
     T* mAddress;
+    int64_t mThreadStart;
 };
 
 // D = alpha * (A @ B + C) + beta
@@ -142,8 +187,13 @@ __global__ void gemm(GemmParams params) {
     __shared__ half tileA[CtaTileT::M * CtaTileT::K];
     __shared__ half tileB[CtaTileT::N * CtaTileT::K];
 
-    alignas(8 * sizeof(half)) half fragementA[8];
-    alignas(8 * sizeof(half)) half fragementB[8];
+    constexpr int MemoryAccessBits = 128;
+    constexpr int VectorSize = MemoryAccessBits/(sizeof(half)*8);
+    using IteratorA = GloablMemoryIterator<BlockSize, CtaTileT::M, CtaTileT::K, half, VectorSize>;
+    using IteratorB = GloablMemoryIterator<BlockSize, CtaTileT::K, CtaTileT::N, half, VectorSize, false/*ThreadMapRowMajor*/>;
+
+    alignas(MemoryAccessBits/8) typename IteratorA::Fragment fragementA;
+    alignas(MemoryAccessBits/8) typename IteratorB::Fragment fragementB;
 
     constexpr int WMMA_M = WarpTileT::M;
     constexpr int WMMA_N = WarpTileT::N;
@@ -162,7 +212,6 @@ __global__ void gemm(GemmParams params) {
         }
     }
 
-
     for (int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K) {
         //1. load A, B to shmem by all threads in this CTA
         int const &localTid = threadIdx.x;
@@ -170,27 +219,16 @@ __global__ void gemm(GemmParams params) {
         // Assuming A is row major
         // 256 threads load 128 x 16 tile A from global memory
         // Each thread load a stipe of 1x8 (128 bits), this makes the threads inside a block structed as 128 x 2
-        constexpr int VectorSize = 8;
-        using IteratorA = GloablMemoryIterator<BlockSize, CtaTileT::M, CtaTileT::K, half, VectorSize>;
         IteratorA iteratorA(threadIdx.x, {blockIdx.x * CtaTileT::M, ctaK}, params.lda, params.ptrA);
         iteratorA.load(fragementA);
-        int shmemAddressA = (localTid / IteratorA::ThreadsCols) * CtaTileT::K +
-                            ((localTid % IteratorA::ThreadsCols) * VectorSize);
-        *reinterpret_cast<uint4 *>(&tileA[shmemAddressA]) = *reinterpret_cast<uint4 *>(&fragementA[0]);
-
+        iteratorA.storeA(fragementA, tileA, CtaTileT::K);
 
         // Assuming B is row major
         // 256 threads load 16 x 128 tile B from global memory
         // Each thread load a stipe of 1x8 (128 bits), this make the threads inside a block structured as: 16 x 16
-        using IteratorB = GloablMemoryIterator<BlockSize, CtaTileT::K, CtaTileT::N, half, VectorSize, false/*ThreadMapRowMajor*/>;
         IteratorB iteratorB(threadIdx.x, {ctaK, blockIdx.y * CtaTileT::N}, params.ldb, params.ptrB);
         iteratorB.load(fragementB);
-
-        for (int i = 0; i < sizeof(fragementB) / sizeof(half); ++i) {
-            int shmemAddressB = ((localTid / IteratorB::ThreadsRows) * VectorSize + i) * CtaTileT::K +
-                                (localTid % IteratorB::ThreadsRows);
-            tileB[shmemAddressB] = fragementB[i];
-        }
+        iteratorB.storeB(fragementB, tileB, CtaTileT::K);
 
         //2. sync cta
         __syncthreads();
