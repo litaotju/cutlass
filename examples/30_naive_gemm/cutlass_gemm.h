@@ -5,6 +5,7 @@
 #include "cutlass/gemm/device/gemm.h"
 #include <iostream>
 #include "cuda_fp16.h"
+#include <exception>
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -402,3 +403,7 @@ cudaError_t AllocateMatrix(T **matrix, int rows, int columns, int seed = 0) {
 
   return result;
 }
+
+
+template<typename Expr>
+inline void ASSERT(Expr expr, char const* msg="Runtime Error") { if (!expr) throw std::runtime_error(msg); }

@@ -399,6 +399,10 @@ __global__ void gemm(GemmParams params) {
 
         for(int wmmaK = 0; wmmaK < CtaTileT::K;  wmmaK += WMMA_K)
         {
+            if(ctaK + wmmaK >= params.K)
+            {
+                break;
+            }
             if(prefetchA) {
                 wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM, wmmaK), matrixA_shared.ldm());
             }
@@ -466,6 +470,10 @@ struct GemmKernel
     {
         auto const M = params.M;
         auto const N = params.N;
+        ASSERT(params.M % WarpTileT::M == 0, "M must be mutiplies of wmma m");
+        ASSERT(params.N % WarpTileT::N == 0, "N must be multiplies of wmma n");
+
+        ASSERT(params.K % WarpTileT::K == 0, "K must be multiplies of wmma k"); //TODO: Do we really need this?
         dim3 grid = {static_cast<uint32_t>(divUp(M, CtaTileT::M)), static_cast<uint32_t>(divUp(N, CtaTileT::N)), 1};
         gemm<BlockSize, CtaTileT, WarpTileT, prefetchA, prefetchB><<<grid, BlockSize, 0, stream>>>(params);
     }
