@@ -354,17 +354,17 @@ __global__ void gemm(GemmParams params) {
 
     wmma::fragment <wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[prefetchA? 2: 1];
     wmma::fragment <wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[prefetchB? 2: 1];
-    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[
+    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> accumulator[
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
-    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag_epilogue[
+    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
     static_assert(CtaTileT::K % WMMA_K == 0);
 
     for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
         for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
-            wmma::fill_fragment(c_frag[m][n], 0);
+            wmma::fill_fragment(accumulator[m][n], 0);
             int globalOffsetM = ctaStartM + wrapStartM + WMMA_M * m;
             int globalOffsetN = ctaStartN + wrapStartN + WMMA_N * n;
             if(globalOffsetM >= params.M || globalOffsetN >= params.N)
@@ -372,7 +372,7 @@ __global__ void gemm(GemmParams params) {
                 continue;
             }
             auto c = reinterpret_cast<half *>(params.ptrC) + globalOffsetM * params.N + globalOffsetN;
-            wmma::load_matrix_sync(c_frag_epilogue[m][n], c, params.N, wmma::mem_row_major);
+            wmma::load_matrix_sync(c_frag[m][n], c, params.N, wmma::mem_row_major);
         }
     }
 
@@ -431,19 +431,19 @@ __global__ void gemm(GemmParams params) {
                                                     &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N * (n + 1)), matrixB_shared.ldm());
                             }
                             // Perform the matrix multiplication
-                            wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[n % 2], c_frag[m][n]);
+                            wmma::mma_sync(accumulator[m][n], a_frag[m % 2], b_frag[n % 2], accumulator[m][n]);
                         }
                         else
                         {
                             wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), matrixB_shared.ldm());
-                            wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[0], c_frag[m][n]);
+                            wmma::mma_sync(accumulator[m][n], a_frag[m % 2], b_frag[0], accumulator[m][n]);
                         }
                     }
                 } else {
                     for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
                         wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM + WMMA_M*m,  wmmaK), matrixA_shared.ldm());
                         wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), matrixB_shared.ldm());
-                        wmma::mma_sync(c_frag[m][n], a_frag[0], b_frag[0], c_frag[m][n]);
+                        wmma::mma_sync(accumulator[m][n], a_frag[0], b_frag[0], accumulator[m][n]);
                     }
                 }
             }
@@ -455,10 +455,10 @@ __global__ void gemm(GemmParams params) {
     // D = alpha * C + beta
     for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
         for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
-            for(int rr=0; rr < c_frag[m][n].num_elements; ++rr)
+            for(int rr=0; rr < accumulator[m][n].num_elements; ++rr)
             {
-                auto & c = c_frag_epilogue[m][n].x[rr];
-                c =  fromFloat<half>(params.alpha* c_frag[m][n].x[rr] + params.beta* toFloat(c))  ;
+                auto & c = c_frag[m][n].x[rr];
+                c =  fromFloat<half>(params.alpha* accumulator[m][n].x[rr] + params.beta* toFloat(c))  ;
             }
             int globalOffsetM = ctaStartM + wrapStartM + WMMA_M * m;
             int globalOffsetN = ctaStartN + wrapStartN + WMMA_N * n;
@@ -466,8 +466,8 @@ __global__ void gemm(GemmParams params) {
             {
                 continue;
             }
-            auto c = reinterpret_cast<half *>(params.ptrD) + globalOffsetM * params.N + globalOffsetN;
-            wmma::store_matrix_sync(c, c_frag_epilogue[m][n], params.N, wmma::mem_row_major);
+            auto d = reinterpret_cast<half *>(params.ptrD) + globalOffsetM * params.N + globalOffsetN;
+            wmma::store_matrix_sync(d, c_frag[m][n], params.N, wmma::mem_row_major);
         }
     }
 }
