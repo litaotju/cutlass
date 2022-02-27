@@ -2,6 +2,7 @@
 #include "cutlass/util/debug.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 #include "mma.h"
+#include <string>
 
 #include <vector>
 #include <cstdio>
@@ -215,12 +216,12 @@ public:
     using MatrixType = Matrix<T, blockSizeR, blockSizeC>;
 
     using Fragment =  T[kIteration][VectorSize];
-    HOST_DEVICE GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address):
-        mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}, mLda(lda), mBlockOffset(blockOffset)
+    HOST_DEVICE GloablMemoryIterator(int threadId, Coords blockOffset, Coords matrixSize, int lda, void *address):
+        mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}, mLda(lda), mBlockOffset(blockOffset), mMatrixSize(matrixSize)
     {
     }
 
-    HOST_DEVICE void load(Fragment& fragment)
+    HOST_DEVICE void load(Fragment& fragment) const
     {
         #pragma unroll kIteration
         for (int i = 0; i < kIteration; ++i)
@@ -228,8 +229,19 @@ public:
             //TODO: this assumes the global matrix is row major(A: MxK, B: KxN), add a variant to column major
             int const r = mBlockOffset.x+row()+i*ThreadStrideR;
             int const c = mBlockOffset.y+col()*VectorSize;
-            int64_t offset = r * mLda + c; 
-            *reinterpret_cast<uint4*>(&fragment[i][0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[offset]);
+            if(r >= mMatrixSize.x || c >= mMatrixSize.y)
+            {
+            #define HANG_BUG_FIXED 0
+            #if HANG_BUG_FIXED
+                for(int v=0; i<VectorSize; ++v) 
+                    fragment[i][v] = T(0);
+            #endif
+            }
+            else
+            {
+                int64_t offset = r * mLda + c; 
+                *reinterpret_cast<uint4*>(&fragment[i][0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[offset]);
+            }
         #if DEBUG
             if(blockIdx.x == 0 && blockIdx.y == 0 && ThreadsCols== 32)
             {
@@ -242,7 +254,7 @@ public:
         }
     }
 
-    HOST_DEVICE void store(Fragment &fragment, MatrixType& dstMatrix)
+    HOST_DEVICE void store(Fragment &fragment, MatrixType& dstMatrix) const
     {
         if(dstMatrix.layout() == Layout::RowMajor)
         {
@@ -281,13 +293,14 @@ public:
 
 private:
     //! The row number of this thread in the structed block
-    HOST_DEVICE int row()
+    HOST_DEVICE int row() const
     {
         return ThreadMapRowMajor ?  mTid/ThreadsCols : mTid% ThreadsRows;
     }
 
     //! The col number of this thread in the structed block
-    HOST_DEVICE int col() {
+    HOST_DEVICE int col() const 
+    {
         return ThreadMapRowMajor ?  mTid%ThreadsCols : mTid/ ThreadsRows;
     }
 
@@ -295,18 +308,19 @@ private:
     T* mAddress; // start adress of the complete matrix (not the start of this cta)
     int mLda; // lead dimension of the global memory
     Coords mBlockOffset; // This block's offset
+    Coords mMatrixSize; // The complete matrix' size
 };
 
 // D = alpha * (A @ B + C) + beta
 // @ means matric multiply
 template<int BlockSize, typename CtaTileT, typename WarpTileT, bool prefetchA=true, bool prefetchB=true>
 __global__ void gemm(GemmParams params) {
-    if (blockIdx.x >= divUp(params.M, CtaTileT::M) || blockIdx.y >= divUp(params.N, CtaTileT::N)) {
-        return;
-    }
-
     int const ctaStartM = blockIdx.x * CtaTileT::M;
     int const ctaStartN = blockIdx.y * CtaTileT::N;
+    if(ctaStartM >= params.M || ctaStartN >= params.N)
+    {
+        return;
+    }
 
     // 8 wrap: 2 x 4;
     int warpId = threadIdx.x / 32;
@@ -340,7 +354,10 @@ __global__ void gemm(GemmParams params) {
 
     wmma::fragment <wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[prefetchA? 2: 1];
     wmma::fragment <wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[prefetchB? 2: 1];
-    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[
+    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[
+            WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
+
+    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag_epilogue[
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
     static_assert(CtaTileT::K % WMMA_K == 0);
@@ -355,12 +372,12 @@ __global__ void gemm(GemmParams params) {
         //1. load A, B to shmem by all threads in this CTA
 
         // Assuming A is row major
-        IteratorA iteratorA(static_cast<int32_t>(threadIdx.x), { static_cast<int32_t>(blockIdx.x) * CtaTileT::M, ctaK}, params.lda, params.ptrA);
+        IteratorA iteratorA(static_cast<int32_t>(threadIdx.x), { static_cast<int32_t>(blockIdx.x) * CtaTileT::M, ctaK}, {params.M, params.K}, params.lda, params.ptrA);
         iteratorA.load(fragementA);
         iteratorA.store(fragementA, matrixA_shared);
 
         // Assuming B is row major
-        IteratorB iteratorB(static_cast<int32_t>(threadIdx.x), {ctaK, static_cast<int32_t>(blockIdx.y) * CtaTileT::N}, params.ldb, params.ptrB);
+        IteratorB iteratorB(static_cast<int32_t>(threadIdx.x), {ctaK, static_cast<int32_t>(blockIdx.y) * CtaTileT::N}, {params.K, params.N}, params.ldb, params.ptrB);
         iteratorB.load(fragementB);
         iteratorB.store(fragementB, matrixB_shared);
 
@@ -426,10 +443,18 @@ __global__ void gemm(GemmParams params) {
     // D = alpha * C + beta
     for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
         for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
+            for(int rr=0; rr < c_frag[m][n].num_elements; ++rr)
+            {
+                c_frag_epilogue[m][n].x[rr] = fromFloat<half>(c_frag[m][n].x[rr]);
+            }
             int globalOffsetM = ctaStartM + wrapStartM + WMMA_M * m;
             int globalOffsetN = ctaStartN + wrapStartN + WMMA_N * n;
+            if(globalOffsetM >= params.M || globalOffsetN >= params.N)
+            {
+                continue;
+            }
             auto c = reinterpret_cast<half *>(params.ptrD) + globalOffsetM * params.N + globalOffsetN;
-            wmma::store_matrix_sync(c, c_frag[m][n], params.N, wmma::mem_row_major);
+            wmma::store_matrix_sync(c, c_frag_epilogue[m][n], params.N, wmma::mem_row_major);
         }
     }
 }
@@ -646,11 +671,30 @@ bool testKernel(Kernel kernelFunc, int M, int N, int K)
     return !hasErr;
 }
 
-int main()
+int main(int argc, char**argv)
 {
     int M = 4096;
     int N = 4096;
     int K = 256;
+
+    for(int argIndex=0; argIndex<argc; ++argIndex)
+    {
+        if(std::string(argv[argIndex]) == "-m")
+        {
+            assert(argIndex+1 < argc);
+            M = std::stoi(argv[argIndex+1]);
+        }
+        else if(std::string(argv[argIndex]) == "-n")
+        {
+            assert(argIndex+1 < argc);
+            N = std::stoi(argv[argIndex+1]);
+        }
+        else if(std::string(argv[argIndex]) == "-k")
+        {
+            assert(argIndex+1 < argc);
+            K = std::stoi(argv[argIndex+1]);
+        }
+    }
 
     using hgemm_128x128_16x16x16 = GemmKernel<256, CtaTile<128, 128, 16>, WarpTile<16, 16, 16>>;
     using hgemm_256x128_16x16x16 = GemmKernel<256, CtaTile<256, 128, 16>, WarpTile<16, 16, 16>>;
@@ -667,15 +711,20 @@ int main()
 
 #define TEST_KERNEL(Kernel) \
     do { \
+        printf("Test %s with [M,N,K] as [%d,%d,%d] ", #Kernel, M, N, K); \
         bool passed = testKernel(Kernel, M, N, K); \
-            printf("%s test %s with:M-N-K %d %d %d\n", #Kernel, (passed ? "PASSED": "FAILED"), M, N, K); \
-    }while(false)
+        printf("%s\n", (passed ? "PASSED": "FAILED")); \
+    } while(false)
 
     TEST_KERNEL(hgemm_128x128_16x16x16());
     TEST_KERNEL(hgemm_256x128_16x16x16());
     TEST_KERNEL(hgemm_128x256_16x16x16());
     TEST_KERNEL(hgemm_256x256_16x16x16());
+
+#define DOUBLE_BUFFER_PARTIAL_CTA_FIXED 0
+#if DOUBLE_BUFFER_PARTIAL_CTA_FIXED
     TEST_KERNEL(double_buffer_kernel);
+#endif
 
     using hgemm_512x512_16x16x16 = GemmKernel<256, CtaTile<512, 512, 16>, WarpTile<16, 16, 16>, true, false>;
     TEST_KERNEL(hgemm_512x512_16x16x16());
