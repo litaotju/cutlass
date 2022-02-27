@@ -121,6 +121,19 @@ public:
     {
         return mLayout;
     }
+
+    HOST_DEVICE void dump()
+    {
+        for(int r=0; r<R; ++r)
+        {
+            printf("row :%d -- ", r);
+            for(int c=0; c<C;++c)
+            {
+                printf("%f ", toFloat(at(r,c)));
+            }
+            printf("\n");
+        }
+    }
 private:
     //!
     //! TODO: only support packed layout for now, publish this ctor and support non packed layout
@@ -171,16 +184,13 @@ public:
     static_assert((blockSizeR*blockSizeC/VectorSize) % Threads == 0 && "The matrix must be able to equally parted by threads");
 
     static constexpr int kIteration = blockSizeR * (blockSizeC / VectorSize) / Threads; // 128 / (256/2) == 1, or 16/(256/16) == 1
-    static_assert((kIteration==1 || kIteration == 2), "Only support 1 iteration now");
     static constexpr int ThreadStrideR = blockSizeR / kIteration; // 16/2 == 8
-    static_assert(ThreadStrideR == 128 || ThreadStrideR == 8 || ThreadStrideR == 16,  "Only support 1 iteration now");
-
     static constexpr int ThreadsCols = blockSizeC / VectorSize; // 256/8 == 32
     static_assert(ThreadsCols < Threads, "Only support for advancing in row dimension for now");
 
     static constexpr int ThreadsRows = Threads / ThreadsCols ; // 256 / 2 = 128, or 256/16 = 16, 256/32 == 8
-    static_assert(std::is_same<T, half>::value);
-    static_assert(VectorSize*sizeof(T)*8 == 128);
+    static_assert(std::is_same<T, half>::value, "Only support half for now");
+    static_assert(VectorSize*sizeof(T)*8 == 128, "Only support 128 bits load for now");
 
     using MatrixType = Matrix<T, blockSizeR, blockSizeC>;
 
@@ -267,7 +277,7 @@ private:
 
 // D = alpha * (A @ B + C) + beta
 // @ means matric multiply
-template<int BlockSize, typename CtaTileT, typename WarpTileT>
+template<int BlockSize, typename CtaTileT, typename WarpTileT, bool prefetchA=true, bool prefetchB=true>
 __global__ void gemm(GemmParams params) {
     if (blockIdx.x >= divUp(params.M, CtaTileT::M) || blockIdx.y >= divUp(params.N, CtaTileT::N)) {
         return;
@@ -339,21 +349,54 @@ __global__ void gemm(GemmParams params) {
         //2. sync cta
         __syncthreads();
 
-        wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM * CtaTileT::K], CtaTileT::K);
-        wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN * CtaTileT::K], CtaTileT::K);
+#if DEBUG
+        if(ctaK == 0 && blockIdx.x ==0 && blockIdx.y == 0 && threadIdx.x == 0)
+        {
+            printf("iter M: %d, iter N: %d\n", WARP_TILE_M/WMMA_M, WARP_TILE_N/WMMA_N);
+            printf("======== Matrix A ===============\n");
+            matrixA_shared.dump();
+            printf("======== Matrix B ===============\n");
+            matrixB_shared.dump();
+        }
+#endif
+
+        static_assert(WARP_TILE_N/WMMA_N <= 2 || !prefetchB, "TODO: the kernel will fail when warp n iteration > 2 and prefetch b");
+
+        if(prefetchA) {
+            wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM * CtaTileT::K], CtaTileT::K);
+        }
+        if(prefetchB) {
+            wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN * CtaTileT::K], CtaTileT::K);
+        }
         for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
-            if (m < WARP_TILE_M / WMMA_M - 1) {
-                wmma::load_matrix_sync(a_frag[(m + 1) % 2], &tileA[(wrapStartM + WMMA_M * (m + 1)) * CtaTileT::K],
-                                       CtaTileT::K);
-            }
-            for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
-                // Load the inputs
-                if (n < WARP_TILE_N / WMMA_N - 1) {
-                    wmma::load_matrix_sync(b_frag[(n + 1) % 2],
-                                           &tileB[(wrapStartN + WMMA_N * (n + 1)) * CtaTileT::K], CtaTileT::K);
+            if(prefetchA) {
+                if (m < WARP_TILE_M / WMMA_M - 1) {
+                    wmma::load_matrix_sync(a_frag[(m + 1) % 2], &tileA[(wrapStartM + WMMA_M * (m + 1)) * CtaTileT::K],
+                                        CtaTileT::K);
                 }
-                // Perform the matrix multiplication
-                wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[n % 2], c_frag[m][n]);
+                for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
+                    if(prefetchB)
+                    {
+                        // Load the inputs
+                        if (n < WARP_TILE_N / WMMA_N - 1) {
+                            wmma::load_matrix_sync(b_frag[(n + 1) % 2],
+                                                &tileB[(wrapStartN + WMMA_N * (n + 1)) * CtaTileT::K], CtaTileT::K);
+                        }
+                        // Perform the matrix multiplication
+                        wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[n % 2], c_frag[m][n]);
+                    }
+                    else
+                    {
+                        wmma::load_matrix_sync(b_frag[0], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K], CtaTileT::K);
+                        wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[0], c_frag[m][n]);
+                    }
+                }
+            } else {
+                for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
+                    wmma::load_matrix_sync(a_frag[1], &tileA[(wrapStartM + WMMA_M*m) * CtaTileT::K], CtaTileT::K);
+                    wmma::load_matrix_sync(b_frag[1], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K], CtaTileT::K);
+                    wmma::mma_sync(c_frag[m][n], a_frag[1], b_frag[1], c_frag[m][n]);
+                }
             }
         }
         //This is essential, otherwise, some threads will override the shared memory while other ones using it
@@ -371,7 +414,7 @@ __global__ void gemm(GemmParams params) {
     }
 }
 
-template<int BlockSize, typename CtaTileT, typename WarpTileT>
+template<int BlockSize, typename CtaTileT, typename WarpTileT, bool prefetchA=true, bool prefetchB=true>
 struct GemmKernel
 {
     void operator()(GemmParams params, cudaStream_t stream)
@@ -379,7 +422,7 @@ struct GemmKernel
         auto const M = params.M;
         auto const N = params.N;
         dim3 grid = {divUp(M, CtaTileT::M), divUp(N, CtaTileT::N), 1};
-        gemm<BlockSize, CtaTileT, WarpTileT><<<grid, BlockSize, 0, stream>>>(params);
+        gemm<BlockSize, CtaTileT, WarpTileT, prefetchA, prefetchB><<<grid, BlockSize, 0, stream>>>(params);
     }
 };
 
@@ -522,11 +565,10 @@ __global__ void gemm_double_buffer_shmem(GemmParams params)
     }
 }
 
-int main()
+//! return true if the kernel can pass ref check with cutclass
+template<typename Kernel>
+bool testKernel(Kernel kernelFunc, int M, int N, int K)
 {
-    int M = 4096;
-    int N = 4096;
-    int K = 256;
     half *A ;
     half *B ;
     half *C ;
@@ -544,33 +586,22 @@ int main()
     //TODO: non-zero value will fail the ref check? Why
     float beta = 0;
     GemmParams params {M, N, K, A, B, C, C, alpha, beta, K, N};
-
-    using hgemm_128x128_16x16x16 = GemmKernel<256, CtaTile<128, 128, 16>, WarpTile<16, 16, 16>>;
-    hgemm_128x128_16x16x16()(params, 0);
-    using hgemm_256x128_16x16x16 = GemmKernel<256, CtaTile<256, 128, 16>, WarpTile<16, 16, 16>>;
-    hgemm_256x128_16x16x16()(params, 0);
-    //TODO: fix this
-    // using hgemm_128x256_16x16x16 = GemmKernel<256, CtaTile<128, 256, 16>, WarpTile<16, 16, 16>>;
-    // hgemm_128x256_16x16x16()(params, 0);
-    // using hgemm_256x256_16x16x16 = GemmKernel<256, CtaTile<256, 226, 16>, WarpTile<16, 16, 16>>;
-    // hgemm_256x256_16x16x16()(params, 0);
-
-    constexpr int BLOCK_SIZE = 256;
-    using CtaTileShape = CtaTile<128, 128, 16>;
-    using ThreadTileShape = ThreadTile<8, 8, 1>;
-    dim3 grid = {divUp(M, CtaTileShape::M), divUp(N, CtaTileShape::N), 1};
-//    gemm_double_buffer_shmem<CtaTileShape, ThreadTileShape> <<<grid, BLOCK_SIZE, 0>>>(params);
+    kernelFunc(params, nullptr/*stream*/);
 
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
-#if 1
-    // cutlass Tensor core gemm has some bug here???
-    CUDA_PERROR(CutlassHgemmTT_TensorCore(M, N, K, alpha, reinterpret_cast<cutlass::half_t const*>(A), K, 
-                 reinterpret_cast<cutlass::half_t const*>(B), N, beta,  reinterpret_cast<cutlass::half_t*>(RefC), N));
-#else
-    CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N));
-#endif
+    constexpr bool CUTLASS_USE_TENSOR_CORE {true};
+    if(CUTLASS_USE_TENSOR_CORE)
+    {
+        // cutlass Tensor core gemm has some bug here???
+        CUDA_PERROR(CutlassHgemmTT_TensorCore(M, N, K, alpha, reinterpret_cast<cutlass::half_t const*>(A), K, 
+                    reinterpret_cast<cutlass::half_t const*>(B), N, beta,  reinterpret_cast<cutlass::half_t*>(RefC), N));
+    }
+    else
+    {
+        CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N));
+    }
 
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(half), cudaMemcpyDeviceToHost));
@@ -578,18 +609,53 @@ int main()
     bool hasErr = false;
     for(int i=0; i < hC.size(); ++i)
     {
-#if DEBUG
-        printf("i %d: a: %f, b: %f\n", i, a, b);
-#endif
         auto a = toFloat(hC[i]);
         auto b = toFloat(hRefC[i]);
         auto const err = std::abs(a-b);
         if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
         {
+#if DEBUG
             printf("i %d: Result: %f, Ref: %f\n", i, a, b);
+#endif
             hasErr = true;
         }
     }
-    printf(hasErr ? "Check Error\n" : "Check Pass\n");
-    return hasErr;
+    return !hasErr;
+}
+
+int main()
+{
+    int M = 4096;
+    int N = 4096;
+    int K = 256;
+
+    using hgemm_128x128_16x16x16 = GemmKernel<256, CtaTile<128, 128, 16>, WarpTile<16, 16, 16>>;
+    using hgemm_256x128_16x16x16 = GemmKernel<256, CtaTile<256, 128, 16>, WarpTile<16, 16, 16>>;
+    using hgemm_128x256_16x16x16 = GemmKernel<256, CtaTile<128, 256, 16>, WarpTile<16, 16, 16>, true, false>;
+    using hgemm_256x256_16x16x16 = GemmKernel<256, CtaTile<256, 256, 16>, WarpTile<16, 16, 16>, true, false>;
+    auto double_buffer_kernel = [](GemmParams params, cudaStream_t stream)
+    {
+        constexpr int BLOCK_SIZE = 256;
+        using CtaTileShape = CtaTile<128, 128, 16>;
+        using ThreadTileShape = ThreadTile<8, 8, 1>;
+        dim3 grid = {divUp(params.M, CtaTileShape::M), divUp(params.N, CtaTileShape::N), 1};
+        gemm_double_buffer_shmem<CtaTileShape, ThreadTileShape> <<<grid, BLOCK_SIZE, 0>>>(params);
+    };
+
+#define TEST_KERNEL(Kernel) \
+    do { \
+        bool passed = testKernel(Kernel, M, N, K); \
+            printf("%s test %s with:M-N-K %d %d %d\n", #Kernel, (passed ? "PASSED": "FAILED"), M, N, K); \
+    }while(false)
+
+    TEST_KERNEL(hgemm_128x128_16x16x16());
+    TEST_KERNEL(hgemm_256x128_16x16x16());
+    TEST_KERNEL(hgemm_128x256_16x16x16());
+    TEST_KERNEL(hgemm_256x256_16x16x16());
+    TEST_KERNEL(double_buffer_kernel);
+
+    using hgemm_512x512_16x16x16 = GemmKernel<256, CtaTile<512, 512, 16>, WarpTile<16, 16, 16>, true, false>;
+    TEST_KERNEL(hgemm_512x512_16x16x16());
+
+#undef TEST_KERNEL
 }
