@@ -364,16 +364,15 @@ __global__ void gemm(GemmParams params) {
         for(int wmmaK = 0; wmmaK < CtaTileT::K;  wmmaK += WMMA_K)
         {
             if(prefetchA) {
-                wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM * CtaTileT::K+wmmaK], CtaTileT::K);
+                wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM, wmmaK), CtaTileT::K);
             }
             if(prefetchB) {
-                wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN * CtaTileT::K+wmmaK], CtaTileT::K);
+                wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN), CtaTileT::K);
             }
             for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
                 if(prefetchA) {
                     if (m < WARP_TILE_M / WMMA_M - 1) {
-                        wmma::load_matrix_sync(a_frag[(m + 1) % 2], &tileA[(wrapStartM + WMMA_M * (m + 1)) * CtaTileT::K + wmmaK],
-                                            CtaTileT::K);
+                        wmma::load_matrix_sync(a_frag[(m + 1) % 2], &matrixA_shared.at(wrapStartM + WMMA_M * (m + 1), wmmaK), CtaTileT::K);
                     }
                     for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
                         if(prefetchB)
@@ -381,21 +380,21 @@ __global__ void gemm(GemmParams params) {
                             // Load the inputs
                             if (n < WARP_TILE_N / WMMA_N - 1) {
                                 wmma::load_matrix_sync(b_frag[(n + 1) % 2],
-                                                    &tileB[(wrapStartN + WMMA_N * (n + 1)) * CtaTileT::K + wmmaK], CtaTileT::K);
+                                                    &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N * (n + 1)), CtaTileT::K);
                             }
                             // Perform the matrix multiplication
                             wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[n % 2], c_frag[m][n]);
                         }
                         else
                         {
-                            wmma::load_matrix_sync(b_frag[0], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K + wmmaK], CtaTileT::K);
+                            wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), CtaTileT::K);
                             wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[0], c_frag[m][n]);
                         }
                     }
                 } else {
                     for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
-                        wmma::load_matrix_sync(a_frag[1], &tileA[(wrapStartM + WMMA_M*m) * CtaTileT::K + wmmaK], CtaTileT::K);
-                        wmma::load_matrix_sync(b_frag[1], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K + wmmaK], CtaTileT::K);
+                        wmma::load_matrix_sync(a_frag[1], &matrixA_shared.at(wrapStartM + WMMA_M*m,  wmmaK), CtaTileT::K);
+                        wmma::load_matrix_sync(b_frag[1], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), CtaTileT::K);
                         wmma::mma_sync(c_frag[m][n], a_frag[1], b_frag[1], c_frag[m][n]);
                     }
                 }
