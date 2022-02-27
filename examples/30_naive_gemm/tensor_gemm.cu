@@ -311,7 +311,7 @@ private:
     Coords mMatrixSize; // The complete matrix' size
 };
 
-// D = alpha * (A @ B + C) + beta
+// D = alpha * (A @ B) + beta * C
 // @ means matric multiply
 template<int BlockSize, typename CtaTileT, typename WarpTileT, bool prefetchA=true, bool prefetchB=true>
 __global__ void gemm(GemmParams params) {
@@ -361,10 +361,18 @@ __global__ void gemm(GemmParams params) {
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
     static_assert(CtaTileT::K % WMMA_K == 0);
-    // Initialize the output to zero
-    for (int m = 0; m < WARP_TILE_M / WMMA_M; ++m) {
-        for (int n = 0; n < WARP_TILE_N / WMMA_N; ++n) {
+
+    for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
+        for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
             wmma::fill_fragment(c_frag[m][n], 0);
+            int globalOffsetM = ctaStartM + wrapStartM + WMMA_M * m;
+            int globalOffsetN = ctaStartN + wrapStartN + WMMA_N * n;
+            if(globalOffsetM >= params.M || globalOffsetN >= params.N)
+            {
+                continue;
+            }
+            auto c = reinterpret_cast<half *>(params.ptrC) + globalOffsetM * params.N + globalOffsetN;
+            wmma::load_matrix_sync(c_frag_epilogue[m][n], c, params.N, wmma::mem_row_major);
         }
     }
 
@@ -449,7 +457,8 @@ __global__ void gemm(GemmParams params) {
         for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
             for(int rr=0; rr < c_frag[m][n].num_elements; ++rr)
             {
-                c_frag_epilogue[m][n].x[rr] = fromFloat<half>(c_frag[m][n].x[rr]);
+                auto & c = c_frag_epilogue[m][n].x[rr];
+                c =  fromFloat<half>(params.alpha* c_frag[m][n].x[rr] + params.beta* toFloat(c))  ;
             }
             int globalOffsetM = ctaStartM + wrapStartM + WMMA_M * m;
             int globalOffsetN = ctaStartN + wrapStartN + WMMA_N * n;
@@ -624,49 +633,54 @@ bool testKernel(Kernel kernelFunc, int M, int N, int K)
     half *A ;
     half *B ;
     half *C ;
-    half *RefC ;
+    half *D ;
+    half *RefD ;
 
-    std::vector<half> hC (M*N, 0);
-    std::vector<half> hRefC (M*N, -1);
+    std::vector<half> hD (M*N, 0);
+    std::vector<half> hRefD (M*N, -1);
 
     CUDA_PERROR(AllocateMatrix(&A, M, K, 10));
     CUDA_PERROR(AllocateMatrix(&B, K, N, 101));
-    CUDA_PERROR(AllocateMatrix(&C, M, N, 10000));
-    CUDA_PERROR(AllocateMatrix(&RefC, M, N, 103));
+    CUDA_PERROR(AllocateMatrix(&C, M, N, 103));
 
-    float alpha = 1;
-    //TODO: non-zero value will fail the ref check? Why
-    float beta = 0;
-    GemmParams params {M, N, K, A, B, C, C, alpha, beta, K, N};
+    CUDA_PERROR(AllocateMatrix(&D, M, N, 10300));
+    CUDA_PERROR(AllocateMatrix(&RefD, M, N, 10432));
+
+    float alpha = 3.14;
+    float beta = 2.31;
+    GemmParams params {M, N, K, A, B, C, D, alpha, beta, K, N};
     kernelFunc(params, nullptr/*stream*/);
 
     CUDA_PERROR(cudaDeviceSynchronize());
-    CUDA_PERROR(cudaMemcpy(hC.data(), C, hC.size()*sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_PERROR(cudaMemcpy(hD.data(), D, hD.size()*sizeof(half), cudaMemcpyDeviceToHost));
 
     constexpr bool CUTLASS_USE_TENSOR_CORE {true};
     if(CUTLASS_USE_TENSOR_CORE)
     {
         // cutlass Tensor core gemm has some bug here???
         CUDA_PERROR(CutlassHgemmTT_TensorCore(M, N, K, alpha, reinterpret_cast<cutlass::half_t const*>(A), K, 
-                    reinterpret_cast<cutlass::half_t const*>(B), N, beta,  reinterpret_cast<cutlass::half_t*>(RefC), N));
+                    reinterpret_cast<cutlass::half_t const*>(B), N, beta,  reinterpret_cast<cutlass::half_t*>(C), N,
+                    reinterpret_cast<cutlass::half_t*>(RefD), N
+                ));
     }
     else
     {
-        CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, RefC, N));
+        CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, C, N, RefD, N));
     }
 
     CUDA_PERROR(cudaDeviceSynchronize());
-    CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_PERROR(cudaMemcpy(hRefD.data(), RefD, hRefD.size()*sizeof(half), cudaMemcpyDeviceToHost));
     CUDA_PERROR(cudaFree(A));
     CUDA_PERROR(cudaFree(B));
     CUDA_PERROR(cudaFree(C));
-    CUDA_PERROR(cudaFree(RefC));
+    CUDA_PERROR(cudaFree(D));
+    CUDA_PERROR(cudaFree(RefD));
 
     bool hasErr = false;
-    for(int i=0; i < hC.size(); ++i)
+    for(int i=0; i < hD.size(); ++i)
     {
-        auto a = toFloat(hC[i]);
-        auto b = toFloat(hRefC[i]);
+        auto a = toFloat(hD[i]);
+        auto b = toFloat(hRefD[i]);
         auto const err = std::abs(a-b);
         if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
         {

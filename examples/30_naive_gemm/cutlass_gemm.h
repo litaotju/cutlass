@@ -134,7 +134,9 @@ cudaError_t CutlassHgemmTT(
   int ldb,
   float beta,
   half *C,
-  int ldc) {
+  int ldc,
+  half *D,
+  int ldd) {
 
   // Define type definition for single-precision CUTLASS GEMM with column-major
   // input matrices and 128x128x8 threadblock tile size (chosen by default).
@@ -170,7 +172,7 @@ cudaError_t CutlassHgemmTT(
                               {A, lda},    // Tensor-ref for source matrix A
                               {B, ldb},    // Tensor-ref for source matrix B
                               {C, ldc},    // Tensor-ref for source matrix C
-                              {C, ldc},    // Tensor-ref for destination matrix D (may be different memory than source C matrix)
+                              {D, ldd},    // Tensor-ref for destination matrix D (may be different memory than source C matrix)
                               {alpha, beta}); // Scalars used in the Epilogue
 
   //
@@ -203,7 +205,9 @@ cudaError_t CutlassHgemmTT_TensorCore(
   int ldb,
   float beta,
   cutlass::half_t *C,
-  int ldc) {
+  int ldc,
+  cutlass::half_t *D,
+  int ldd) {
 
   using ElementOutput = cutlass::half_t;
   using ElementComputeEpilogue = float;
@@ -276,7 +280,7 @@ cudaError_t CutlassHgemmTT_TensorCore(
                          {A, lda},    // Tensor-ref for source matrix A
                          {B, ldb},    // Tensor-ref for source matrix B
                          {C, ldc},    // Tensor-ref for source matrix C
-                         {C, ldc},    // Tensor-ref for destination matrix D (may be different memory than source C matrix)
+                         {D, ldd},    // Tensor-ref for destination matrix D (may be different memory than source C matrix)
                          {alpha, beta}); // Scalars used in the Epilogue
 
     //
