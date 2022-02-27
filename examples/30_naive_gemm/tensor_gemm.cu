@@ -1,6 +1,13 @@
 #include "cutlass_gemm.h"
+
 #include "cutlass/util/debug.h"
+#include "cutlass/util/host_tensor.h"
+#include "cutlass/util/reference/device/tensor_fill.h"
+#include "cutlass/util/reference/host/tensor_compare.h"
+#include "cutlass/util/tensor_view_io.h"
+
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
+
 #include "mma.h"
 #include <string>
 
@@ -495,67 +502,60 @@ struct GemmKernel
 template<typename Kernel>
 bool testKernel(Kernel kernelFunc, int M, int N, int K)
 {
-    half *A ;
-    half *B ;
-    half *C ;
-    half *D ;
-    half *RefD ;
+    using Tensor = cutlass::HostTensor<cutlass::half_t, cutlass::layout::RowMajor>;
+    Tensor A(cutlass::MatrixCoord(M, K));
+    Tensor B(cutlass::MatrixCoord(K, N));
+    Tensor C(cutlass::MatrixCoord(M, N));
 
-    std::vector<half> hD (M*N, 0);
-    std::vector<half> hRefD (M*N, -1);
+    cutlass::half_t mean = 0.0_hf;
+    cutlass::half_t stddev = 5.0_hf;
 
-    CUDA_PERROR(AllocateMatrix(&A, M, K, 10));
-    CUDA_PERROR(AllocateMatrix(&B, K, N, 101));
-    CUDA_PERROR(AllocateMatrix(&C, M, N, 103));
+    // Specify the number of bits right of the binary decimal that are permitted
+    // to be non-zero. A value of "0" here truncates random values to integers
+    int bits_less_than_one = 0;
 
-    CUDA_PERROR(AllocateMatrix(&D, M, N, 10300));
-    CUDA_PERROR(AllocateMatrix(&RefD, M, N, 10432));
+    cutlass::reference::device::TensorFillRandomGaussian(A.device_view(), 1234, mean, stddev, bits_less_than_one);
+    cutlass::reference::device::TensorFillRandomGaussian(B.device_view(), 4321, mean, stddev, bits_less_than_one);
+    cutlass::reference::device::TensorFillRandomGaussian(C.device_view(), 789, mean, stddev, bits_less_than_one);
+
+    Tensor D(cutlass::MatrixCoord(M, N));
+    Tensor RefD(cutlass::MatrixCoord(M, N));
 
     float alpha = 3.14;
     float beta = 2.31;
-    GemmParams params {M, N, K, A, B, C, D, alpha, beta, K, N};
+    GemmParams params {M, N, K, A.device_data(), B.device_data(), C.device_data(), D.device_data(), alpha, beta, K, N};
     kernelFunc(params, nullptr/*stream*/);
 
     CUDA_PERROR(cudaDeviceSynchronize());
-    CUDA_PERROR(cudaMemcpy(hD.data(), D, hD.size()*sizeof(half), cudaMemcpyDeviceToHost));
+    D.sync_host();
 
     constexpr bool CUTLASS_USE_TENSOR_CORE {true};
     if(CUTLASS_USE_TENSOR_CORE)
     {
         // cutlass Tensor core gemm has some bug here???
-        CUDA_PERROR(CutlassHgemmTT_TensorCore(M, N, K, alpha, reinterpret_cast<cutlass::half_t const*>(A), K, 
-                    reinterpret_cast<cutlass::half_t const*>(B), N, beta,  reinterpret_cast<cutlass::half_t*>(C), N,
-                    reinterpret_cast<cutlass::half_t*>(RefD), N
-                ));
+        CUDA_PERROR(CutlassHgemmTT_TensorCore(M, N, K, alpha, A.device_data(), K, 
+                    B.device_data(), N, beta,  C.device_data(), N, RefD.device_data(), N));
     }
     else
     {
-        CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, A, K, B, N, beta, C, N, RefD, N));
+        CUDA_PERROR(CutlassHgemmTT(M, N, K, alpha, reinterpret_cast<half*>(A.device_data()), K, 
+                    reinterpret_cast<half*>(B.device_data()), N, beta,  
+                    reinterpret_cast<half*>(C.device_data()), N, 
+                    reinterpret_cast<half*>(RefD.device_data()), N));
     }
 
     CUDA_PERROR(cudaDeviceSynchronize());
-    CUDA_PERROR(cudaMemcpy(hRefD.data(), RefD, hRefD.size()*sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_PERROR(cudaFree(A));
-    CUDA_PERROR(cudaFree(B));
-    CUDA_PERROR(cudaFree(C));
-    CUDA_PERROR(cudaFree(D));
-    CUDA_PERROR(cudaFree(RefD));
+    RefD.sync_host();
 
-    bool hasErr = false;
-    for(int i=0; i < hD.size(); ++i)
+    bool const pass = cutlass::reference::host::TensorEquals(D.host_view(), RefD.host_view());
+    if(!pass)
     {
-        auto a = toFloat(hD[i]);
-        auto b = toFloat(hRefD[i]);
-        auto const err = std::abs(a-b);
-        if(err >=1e-3 && err >= 0.05*std::max(std::abs(a), std::abs(b)))
-        {
-#if DEBUG
-            printf("i %d: Result: %f, Ref: %f\n", i, a, b);
-#endif
-            hasErr = true;
-        }
+        char const *filename = "tensor_gemm.csv";
+        std::ofstream file(filename);
+        file << "\n\n Result: == \n" << D.host_view() << std::endl;
+        file << "\n\n Reference: == \n" << RefD.host_view() << std::endl;
     }
-    return !hasErr;
+    return pass;
 }
 
 int main(int argc, char**argv)
