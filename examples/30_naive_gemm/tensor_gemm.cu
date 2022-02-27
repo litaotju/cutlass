@@ -313,7 +313,8 @@ private:
 
 // D = alpha * (A @ B) + beta * C
 // @ means matric multiply
-template<int BlockSize, typename CtaTileT, typename WarpTileT, bool prefetchA=true, bool prefetchB=true>
+template<int BlockSize, typename CtaTileT, 
+        typename WarpTileT, bool prefetchA=true, bool prefetchB=true, typename AccumulatorType=float>
 __global__ void gemm(GemmParams params) {
     int const ctaStartM = blockIdx.x * CtaTileT::M;
     int const ctaStartN = blockIdx.y * CtaTileT::N;
@@ -354,7 +355,7 @@ __global__ void gemm(GemmParams params) {
 
     wmma::fragment <wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[prefetchA? 2: 1];
     wmma::fragment <wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[prefetchB? 2: 1];
-    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> accumulator[
+    wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, AccumulatorType> accumulator[
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
     wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[
@@ -460,7 +461,7 @@ __global__ void gemm(GemmParams params) {
             for(int rr=0; rr < accumulator[m][n].num_elements; ++rr)
             {
                 auto & c = c_frag[m][n].x[rr];
-                c =  fromFloat<half>(params.alpha* accumulator[m][n].x[rr] + params.beta* toFloat(c))  ;
+                c =  fromFloat<half>(params.alpha* toFloat(accumulator[m][n].x[rr]) + params.beta* toFloat(c));
             }
             int globalOffsetM = ctaStartM + wrapStartM + WMMA_M * m;
             int globalOffsetN = ctaStartN + wrapStartN + WMMA_N * n;
@@ -474,7 +475,7 @@ __global__ void gemm(GemmParams params) {
     }
 }
 
-template<int BlockSize, typename CtaTileT, typename WarpTileT, bool prefetchA=true, bool prefetchB=true>
+template<int BlockSize, typename CtaTileT, typename WarpTileT, bool prefetchA=true, bool prefetchB=true, typename AccumulatorType=float>
 struct GemmKernel
 {
     void operator()(GemmParams params, cudaStream_t stream)
@@ -486,7 +487,7 @@ struct GemmKernel
 
         ASSERT(params.K % WarpTileT::K == 0, "K must be multiplies of wmma k"); //TODO: Do we really need this?
         dim3 grid = {static_cast<uint32_t>(divUp(M, CtaTileT::M)), static_cast<uint32_t>(divUp(N, CtaTileT::N)), 1};
-        gemm<BlockSize, CtaTileT, WarpTileT, prefetchA, prefetchB><<<grid, BlockSize, 0, stream>>>(params);
+        gemm<BlockSize, CtaTileT, WarpTileT, prefetchA, prefetchB, AccumulatorType><<<grid, BlockSize, 0, stream>>>(params);
     }
 };
 
@@ -610,4 +611,7 @@ int main(int argc, char**argv)
     using hgemm_128x128x32_8x32x16 = GemmKernel<256, CtaTile<128, 128, 32>, WarpTile<8, 32, 16>, true, false>;
     TEST_KERNEL(hgemm_128x128x32_8x32x16());
 
+    // Half AccmulatorType kernel
+    using hgemm_h128x128x32_16x16x16 = GemmKernel<256, CtaTile<128, 128, 32>, WarpTile<16, 16, 16>, true, true, half>;
+    TEST_KERNEL(hgemm_h128x128x32_16x16x16());
 }
