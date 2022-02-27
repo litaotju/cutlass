@@ -159,6 +159,7 @@ private:
 //! \tparam T : element type
 //! \tparam VectorSize : the number of scalar (T) per Vector, one memory access is loading one Vector
 //! \tparam ThreadMapRowMajor : how to arrange the threads
+//!           this is a perf tuning parameter, does not affect the correction of the load.
 //!       For example, RowMajor 16x16 means the threads are arranged like follows:
 //              0  1  2 ... 15
 //              16 17 18 ... 31
@@ -198,8 +199,6 @@ public:
     HOST_DEVICE GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address):
         mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}, mLda(lda), mBlockOffset(blockOffset)
     {
-        //TODO: this assumes the global matrix is row major(A: MxK, B: KxN), add a variant to column major
-        // mThreadStart = (blockOffset.x + row()) * lda + blockOffset.y+col()*VectorSize;
     }
 
     HOST_DEVICE void load(Fragment& fragment)
@@ -207,6 +206,7 @@ public:
         #pragma unroll kIteration
         for (int i = 0; i < kIteration; ++i)
         { 
+            //TODO: this assumes the global matrix is row major(A: MxK, B: KxN), add a variant to column major
             int const r = mBlockOffset.x+row()+i*ThreadStrideR;
             int const c = mBlockOffset.y+col()*VectorSize;
             int64_t offset = r * mLda + c; 
@@ -261,18 +261,21 @@ public:
     }
 
 private:
+    //! The row number of this thread in the structed block
     HOST_DEVICE int row()
     {
         return ThreadMapRowMajor ?  mTid/ThreadsCols : mTid% ThreadsRows;
     }
+
+    //! The col number of this thread in the structed block
     HOST_DEVICE int col() {
         return ThreadMapRowMajor ?  mTid%ThreadsCols : mTid/ ThreadsRows;
     }
-    int mTid;
-    T* mAddress;
+
+    int mTid; // The thread id
+    T* mAddress; // start adress of the complete matrix (not the start of this cta)
     int mLda; // lead dimension of the global memory
-    int64_t mThreadStart;
-    Coords mBlockOffset;
+    Coords mBlockOffset; // This block's offset
 };
 
 // D = alpha * (A @ B + C) + beta
@@ -289,11 +292,14 @@ __global__ void gemm(GemmParams params) {
     // 8 wrap: 2 x 4;
     int warpId = threadIdx.x / 32;
     assert(blockDim.x == 256);
-    constexpr int NUM_WARPS = 8; // blockDim.x/32;
     constexpr int WARP_ROW = 2;
     constexpr int WARP_COL = 4;
-    constexpr int WARP_TILE_M = CtaTileT::M / WARP_ROW; // 128/2 = 64
-    constexpr int WARP_TILE_N = CtaTileT::N / WARP_COL; // 128/4 = 32
+    constexpr int WARP_TILE_M = CtaTileT::M / WARP_ROW; // The tile size in M computed by a warp
+    constexpr int WARP_TILE_N = CtaTileT::N / WARP_COL; // The tile size in N computed by a warp
+
+    constexpr int WMMA_M = WarpTileT::M;
+    constexpr int WMMA_N = WarpTileT::N;
+    constexpr int WMMA_K = WarpTileT::K;
 
     const int wrapStartM = (warpId / WARP_COL) * WARP_TILE_M;
     const int wrapStartN = (warpId % WARP_COL) * WARP_TILE_N;
@@ -303,17 +309,15 @@ __global__ void gemm(GemmParams params) {
 
     constexpr int MemoryAccessBits = 128;
     constexpr int VectorSize = MemoryAccessBits/(sizeof(half)*8);
+
     using IteratorA = GloablMemoryIterator<BlockSize, CtaTileT::M, CtaTileT::K, half, VectorSize>;
+    // Using the RowMajorMap for B has worse performance.
     using IteratorB = GloablMemoryIterator<BlockSize, CtaTileT::K, CtaTileT::N, half, VectorSize, false/*ThreadMapRowMajor*/>;
 
     typename  IteratorA::MatrixType matrixA_shared(&tileA[0], Layout::RowMajor);
     typename  IteratorB::MatrixType matrixB_shared(&tileB[0], Layout::ColMajor);
     alignas(MemoryAccessBits/8) typename IteratorA::Fragment fragementA;
     alignas(MemoryAccessBits/8) typename IteratorB::Fragment fragementB;
-
-    constexpr int WMMA_M = WarpTileT::M;
-    constexpr int WMMA_N = WarpTileT::N;
-    constexpr int WMMA_K = WarpTileT::K;
 
     wmma::fragment <wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[2];
     wmma::fragment <wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[2];
@@ -330,19 +334,14 @@ __global__ void gemm(GemmParams params) {
 
     for (int ctaK = 0; ctaK < params.K; ctaK += CtaTileT::K) {
         //1. load A, B to shmem by all threads in this CTA
-        int const &localTid = threadIdx.x;
 
         // Assuming A is row major
-        // 256 threads load 128 x 16 tile A from global memory
-        // Each thread load a stipe of 1x8 (128 bits), this makes the threads inside a block structed as 128 x 2
-        IteratorA iteratorA(threadIdx.x, {blockIdx.x * CtaTileT::M, ctaK}, params.lda, params.ptrA);
+        IteratorA iteratorA(static_cast<int32_t>(threadIdx.x), { static_cast<int32_t>(blockIdx.x) * CtaTileT::M, ctaK}, params.lda, params.ptrA);
         iteratorA.load(fragementA);
         iteratorA.store(fragementA, matrixA_shared);
 
         // Assuming B is row major
-        // 256 threads load 16 x 128 tile B from global memory
-        // Each thread load a stipe of 1x8 (128 bits), this make the threads inside a block structured as: 16 x 16
-        IteratorB iteratorB(threadIdx.x, {ctaK, blockIdx.y * CtaTileT::N}, params.ldb, params.ptrB);
+        IteratorB iteratorB(static_cast<int32_t>(threadIdx.x), {ctaK, static_cast<int32_t>(blockIdx.y) * CtaTileT::N}, params.ldb, params.ptrB);
         iteratorB.load(fragementB);
         iteratorB.store(fragementB, matrixB_shared);
 
@@ -421,7 +420,7 @@ struct GemmKernel
     {
         auto const M = params.M;
         auto const N = params.N;
-        dim3 grid = {divUp(M, CtaTileT::M), divUp(N, CtaTileT::N), 1};
+        dim3 grid = {static_cast<uint32_t>(divUp(M, CtaTileT::M)), static_cast<uint32_t>(divUp(N, CtaTileT::N)), 1};
         gemm<BlockSize, CtaTileT, WarpTileT, prefetchA, prefetchB><<<grid, BlockSize, 0, stream>>>(params);
     }
 };
@@ -442,7 +441,6 @@ __global__ void gemm_double_buffer_shmem(GemmParams params)
     // 8 wrap: 2 x 4;
     int warpId = threadIdx.x / 32;
     assert(blockDim.x == 256);
-    constexpr int NUM_WARPS = 8; // blockDim.x/32;
     constexpr int WARP_ROW = 2;
     constexpr int WARP_COL = 4;
     constexpr int WARP_TILE_M = CtaTileT::M/WARP_ROW; // 128/2 = 64
@@ -638,7 +636,7 @@ int main()
         constexpr int BLOCK_SIZE = 256;
         using CtaTileShape = CtaTile<128, 128, 16>;
         using ThreadTileShape = ThreadTile<8, 8, 1>;
-        dim3 grid = {divUp(params.M, CtaTileShape::M), divUp(params.N, CtaTileShape::N), 1};
+        dim3 grid = {static_cast<uint32_t>(divUp(params.M, CtaTileShape::M)), static_cast<uint32_t>(divUp(params.N, CtaTileShape::N)), 1};
         gemm_double_buffer_shmem<CtaTileShape, ThreadTileShape> <<<grid, BLOCK_SIZE, 0>>>(params);
     };
 
