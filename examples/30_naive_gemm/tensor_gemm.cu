@@ -223,7 +223,7 @@ public:
     using MatrixType = Matrix<T, blockSizeR, blockSizeC>;
 
     using Fragment =  T[kIteration][VectorSize];
-    HOST_DEVICE GloablMemoryIterator(int threadId, Coords blockOffset, Coords matrixSize, int lda, void *address):
+    HOST_DEVICE GloablMemoryIterator(int threadId, Coords blockOffset, Coords matrixSize, int lda, T *address):
         mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}, mLda(lda), mBlockOffset(blockOffset), mMatrixSize(matrixSize)
     {
     }
@@ -247,7 +247,7 @@ public:
             else
             {
                 int64_t offset = r * mLda + c; 
-                *reinterpret_cast<uint4*>(&fragment[i][0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[offset]);
+                load_vector(fragment[i], &mAddress[offset]);
             }
         #if DEBUG
             if(blockIdx.x == 0 && blockIdx.y == 0 && ThreadsCols== 32)
@@ -309,6 +309,14 @@ private:
     HOST_DEVICE int col() const 
     {
         return ThreadMapRowMajor ?  mTid%ThreadsCols : mTid/ ThreadsRows;
+    }
+
+    using Vector = T[VectorSize];
+    //! Load a 8-half vector from memory
+    HOST_DEVICE static void load_vector(Vector &dst, void* src)
+    {
+        //TODO: use some inline ptx for this vector load?
+        *reinterpret_cast<uint4*>(&dst[0]) = *reinterpret_cast<uint4*>(src);
     }
 
     int mTid; // The thread id
@@ -390,12 +398,14 @@ __global__ void gemm(GemmParams params) {
         //1. load A, B to shmem by all threads in this CTA
 
         // Assuming A is row major
-        IteratorA iteratorA(static_cast<int32_t>(threadIdx.x), { static_cast<int32_t>(blockIdx.x) * CtaTileT::M, ctaK}, {params.M, params.K}, params.lda, params.ptrA);
+        IteratorA iteratorA(static_cast<int32_t>(threadIdx.x), {static_cast<int32_t>(blockIdx.x) * CtaTileT::M, ctaK}, 
+                    {params.M, params.K}, params.lda, reinterpret_cast<half*>(params.ptrA));
         iteratorA.load(fragementA);
         iteratorA.store(fragementA, matrixA_shared);
 
         // Assuming B is row major
-        IteratorB iteratorB(static_cast<int32_t>(threadIdx.x), {ctaK, static_cast<int32_t>(blockIdx.y) * CtaTileT::N}, {params.K, params.N}, params.ldb, params.ptrB);
+        IteratorB iteratorB(static_cast<int32_t>(threadIdx.x), {ctaK, static_cast<int32_t>(blockIdx.y) * CtaTileT::N}, 
+                    {params.K, params.N}, params.ldb, reinterpret_cast<half*>(params.ptrB));
         iteratorB.load(fragementB);
         iteratorB.store(fragementB, matrixB_shared);
 
