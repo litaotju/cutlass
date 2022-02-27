@@ -319,8 +319,8 @@ __global__ void gemm(GemmParams params) {
     alignas(MemoryAccessBits/8) typename IteratorA::Fragment fragementA;
     alignas(MemoryAccessBits/8) typename IteratorB::Fragment fragementB;
 
-    wmma::fragment <wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[2];
-    wmma::fragment <wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[2];
+    wmma::fragment <wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> a_frag[prefetchA? 2: 1];
+    wmma::fragment <wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::col_major> b_frag[prefetchB? 2: 1];
     wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
@@ -393,9 +393,9 @@ __global__ void gemm(GemmParams params) {
                     }
                 } else {
                     for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
-                        wmma::load_matrix_sync(a_frag[1], &matrixA_shared.at(wrapStartM + WMMA_M*m,  wmmaK), CtaTileT::K);
-                        wmma::load_matrix_sync(b_frag[1], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), CtaTileT::K);
-                        wmma::mma_sync(c_frag[m][n], a_frag[1], b_frag[1], c_frag[m][n]);
+                        wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM + WMMA_M*m,  wmmaK), CtaTileT::K);
+                        wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), CtaTileT::K);
+                        wmma::mma_sync(c_frag[m][n], a_frag[0], b_frag[0], c_frag[m][n]);
                     }
                 }
             }
