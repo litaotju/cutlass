@@ -122,6 +122,11 @@ public:
         return mLayout;
     }
 
+    HOST_DEVICE int ldm() const
+    {
+        return layout() == Layout::RowMajor ? mStrides[0] : mStrides[1];
+    }
+
     HOST_DEVICE void dump()
     {
         for(int r=0; r<R; ++r)
@@ -133,6 +138,20 @@ public:
             }
             printf("\n");
         }
+    }
+
+    //! Set the non default ldm value, by default, the ctor will assume it's a packed dense layout
+    //!!! Use with caustion. Please be sure about what you are doing.
+    HOST_DEVICE void setLdm(int ldm)
+    {
+       if(layout() == Layout::RowMajor)
+       {
+           mStrides[0] = ldm;
+       } 
+       else
+       {
+           mStrides[1] = ldm;
+       }
     }
 private:
     //!
@@ -146,7 +165,7 @@ private:
     }
     T* mMemory;
     Layout mLayout;
-    int64_t mStrides[2];
+    int64_t mStrides[2] = {1, 1};
 };
 
 //!
@@ -364,15 +383,15 @@ __global__ void gemm(GemmParams params) {
         for(int wmmaK = 0; wmmaK < CtaTileT::K;  wmmaK += WMMA_K)
         {
             if(prefetchA) {
-                wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM, wmmaK), CtaTileT::K);
+                wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM, wmmaK), matrixA_shared.ldm());
             }
             if(prefetchB) {
-                wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN), CtaTileT::K);
+                wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN), matrixB_shared.ldm());
             }
             for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
                 if(prefetchA) {
                     if (m < WARP_TILE_M / WMMA_M - 1) {
-                        wmma::load_matrix_sync(a_frag[(m + 1) % 2], &matrixA_shared.at(wrapStartM + WMMA_M * (m + 1), wmmaK), CtaTileT::K);
+                        wmma::load_matrix_sync(a_frag[(m + 1) % 2], &matrixA_shared.at(wrapStartM + WMMA_M * (m + 1), wmmaK), matrixA_shared.ldm());
                     }
                     for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
                         if(prefetchB)
@@ -380,21 +399,21 @@ __global__ void gemm(GemmParams params) {
                             // Load the inputs
                             if (n < WARP_TILE_N / WMMA_N - 1) {
                                 wmma::load_matrix_sync(b_frag[(n + 1) % 2],
-                                                    &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N * (n + 1)), CtaTileT::K);
+                                                    &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N * (n + 1)), matrixB_shared.ldm());
                             }
                             // Perform the matrix multiplication
                             wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[n % 2], c_frag[m][n]);
                         }
                         else
                         {
-                            wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), CtaTileT::K);
+                            wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), matrixB_shared.ldm());
                             wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[0], c_frag[m][n]);
                         }
                     }
                 } else {
                     for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
-                        wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM + WMMA_M*m,  wmmaK), CtaTileT::K);
-                        wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), CtaTileT::K);
+                        wmma::load_matrix_sync(a_frag[0], &matrixA_shared.at(wrapStartM + WMMA_M*m,  wmmaK), matrixA_shared.ldm());
+                        wmma::load_matrix_sync(b_frag[0], &matrixB_shared.at(wmmaK, wrapStartN + WMMA_N*n), matrixB_shared.ldm());
                         wmma::mma_sync(c_frag[m][n], a_frag[0], b_frag[0], c_frag[m][n]);
                     }
                 }
