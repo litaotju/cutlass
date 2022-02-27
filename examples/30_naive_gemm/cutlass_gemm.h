@@ -338,7 +338,7 @@ __global__ void InitializeMatrix_kernel(
   int j = threadIdx.y + blockIdx.y * blockDim.y;
 
   if (i < rows && j < columns) {
-    int offset = i + j * rows;
+    int offset = i *columns + j;
 
     // Generate arbitrary elements.
     int const k = 16807;

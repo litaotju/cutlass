@@ -171,40 +171,81 @@ public:
     static_assert((blockSizeR*blockSizeC/VectorSize) % Threads == 0 && "The matrix must be able to equally parted by threads");
 
     static constexpr int kIteration = blockSizeR * (blockSizeC / VectorSize) / Threads; // 128 / (256/2) == 1, or 16/(256/16) == 1
-    static_assert(kIteration == 1 && "Only support 1 iteration now");
+    static_assert((kIteration==1 || kIteration == 2), "Only support 1 iteration now");
+    static constexpr int ThreadStrideR = blockSizeR / kIteration; // 16/2 == 8
+    static_assert(ThreadStrideR == 128 || ThreadStrideR == 8 || ThreadStrideR == 16,  "Only support 1 iteration now");
 
-    static constexpr int ThreadsCols = blockSizeC / VectorSize; // 2 or 16
-    static constexpr int ThreadsRows = Threads / ThreadsCols ; // 256 / 2 = 128, or 256/16 = 16
+    static constexpr int ThreadsCols = blockSizeC / VectorSize; // 256/8 == 32
+    static_assert(ThreadsCols < Threads, "Only support for advancing in row dimension for now");
+
+    static constexpr int ThreadsRows = Threads / ThreadsCols ; // 256 / 2 = 128, or 256/16 = 16, 256/32 == 8
     static_assert(std::is_same<T, half>::value);
     static_assert(VectorSize*sizeof(T)*8 == 128);
 
     using MatrixType = Matrix<T, blockSizeR, blockSizeC>;
 
-    using Fragment =  T[VectorSize];
+    using Fragment =  T[kIteration][VectorSize];
     HOST_DEVICE GloablMemoryIterator(int threadId, Coords blockOffset, int lda, void *address):
-        mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}
+        mTid{threadId}, mAddress{reinterpret_cast<T*>(address)}, mLda(lda), mBlockOffset(blockOffset)
     {
         //TODO: this assumes the global matrix is row major(A: MxK, B: KxN), add a variant to column major
-        mThreadStart = (blockOffset.x + row()) * lda + blockOffset.y+col()*VectorSize;
+        // mThreadStart = (blockOffset.x + row()) * lda + blockOffset.y+col()*VectorSize;
     }
 
     HOST_DEVICE void load(Fragment& fragment)
     {
-        *reinterpret_cast<uint4*>(&fragment[0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[mThreadStart]);
+        #pragma unroll kIteration
+        for (int i = 0; i < kIteration; ++i)
+        { 
+            int const r = mBlockOffset.x+row()+i*ThreadStrideR;
+            int const c = mBlockOffset.y+col()*VectorSize;
+            int64_t offset = r * mLda + c; 
+            *reinterpret_cast<uint4*>(&fragment[i][0]) = *reinterpret_cast<uint4*>(&reinterpret_cast<half*>(mAddress)[offset]);
+        #if DEBUG
+            if(blockIdx.x == 0 && blockIdx.y == 0 && ThreadsCols== 32)
+            {
+                if(threadIdx.x == 0 )
+                {
+                    printf("== tid: %d, iter:%d row:%d, col:%d, globalR:%d, globalC:%d, val:[%f %f] \n", threadIdx.x, i, row(), col(), r, c, toFloat(fragment[i][0]), toFloat(fragment[i][7]));
+                }
+            }
+        #endif
+        }
     }
 
     HOST_DEVICE void store(Fragment &fragment, MatrixType& dstMatrix)
     {
         if(dstMatrix.layout() == Layout::RowMajor)
         {
-            auto &dst = dstMatrix.at(row(), col()*VectorSize);
-            *reinterpret_cast<uint4 *>(&dst) = *reinterpret_cast<uint4 *>(&fragment[0]);
+            #pragma unroll kIteration
+            for(int i=0; i<kIteration; ++i)
+            {
+                auto &dst = dstMatrix.at(row() + i*ThreadStrideR, col()*VectorSize);
+                *reinterpret_cast<uint4 *>(&dst) = *reinterpret_cast<uint4 *>(&fragment[i][0]);
+            }
         }
         else
         {
-            for(int i=0; i < VectorSize; ++i)
+            #pragma unroll kIteration
+            for(int i=0; i<kIteration; ++i)
             {
-                dstMatrix.at(row(), col()*VectorSize+i) = fragment[i];
+                int const r = mBlockOffset.x+row()+i*ThreadStrideR;
+                int const c = mBlockOffset.y + col()*VectorSize;
+        #if DEBUG
+                if(blockIdx.x == 0 && blockIdx.y == 0)
+                {
+                    if(threadIdx.x == 0 )
+                    {
+                        printf("tid: %d, iter:%d row:%d, col:%d, globalR:%d, globalC:%d, val:[%f %f] \n", threadIdx.x, i, row(), col(), r, c, toFloat(fragment[i][0]), toFloat(fragment[i][7]));
+                    }
+                }
+        #endif
+
+                #pragma unroll VectorSize 
+                for(int v=0; v < VectorSize; ++v)
+                {
+                    dstMatrix.at(row() + i*ThreadStrideR, col()*VectorSize+v) = fragment[i][v];
+                }
             }
         }
     }
@@ -219,7 +260,9 @@ private:
     }
     int mTid;
     T* mAddress;
+    int mLda; // lead dimension of the global memory
     int64_t mThreadStart;
+    Coords mBlockOffset;
 };
 
 // D = alpha * (A @ B + C) + beta
@@ -504,9 +547,13 @@ int main()
 
     using hgemm_128x128_16x16x16 = GemmKernel<256, CtaTile<128, 128, 16>, WarpTile<16, 16, 16>>;
     hgemm_128x128_16x16x16()(params, 0);
-    //TODO: instance other kernel variants correctly
-//    using hgemm_256x128_16x16x16 = GemmKernel<128, CtaTile<256, 128, 16>, WarpTile<16, 16, 16>>;
-//    hgemm_256x128_16x16x16()(params, 0);
+    using hgemm_256x128_16x16x16 = GemmKernel<256, CtaTile<256, 128, 16>, WarpTile<16, 16, 16>>;
+    hgemm_256x128_16x16x16()(params, 0);
+    //TODO: fix this
+    // using hgemm_128x256_16x16x16 = GemmKernel<256, CtaTile<128, 256, 16>, WarpTile<16, 16, 16>>;
+    // hgemm_128x256_16x16x16()(params, 0);
+    // using hgemm_256x256_16x16x16 = GemmKernel<256, CtaTile<256, 226, 16>, WarpTile<16, 16, 16>>;
+    // hgemm_256x256_16x16x16()(params, 0);
 
     constexpr int BLOCK_SIZE = 256;
     using CtaTileShape = CtaTile<128, 128, 16>;
