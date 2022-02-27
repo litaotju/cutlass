@@ -580,10 +580,10 @@ int main(int argc, char**argv)
         }
     }
 
-    using hgemm_128x128_16x16x16 = GemmKernel<256, CtaTile<128, 128, 16>, WarpTile<16, 16, 16>>;
-    using hgemm_256x128_16x16x16 = GemmKernel<256, CtaTile<256, 128, 16>, WarpTile<16, 16, 16>>;
-    using hgemm_128x256_16x16x16 = GemmKernel<256, CtaTile<128, 256, 16>, WarpTile<16, 16, 16>, true, false>;
-    using hgemm_256x256_16x16x16 = GemmKernel<256, CtaTile<256, 256, 16>, WarpTile<16, 16, 16>, true, false>;
+    using hgemm_128x128x16_16x16x16 = GemmKernel<256, CtaTile<128, 128, 16>, WarpTile<16, 16, 16>>;
+    using hgemm_256x128x16_16x16x16 = GemmKernel<256, CtaTile<256, 128, 16>, WarpTile<16, 16, 16>>;
+    using hgemm_128x256x16_16x16x16 = GemmKernel<256, CtaTile<128, 256, 16>, WarpTile<16, 16, 16>, true, false>;
+    using hgemm_256x256x16_16x16x16 = GemmKernel<256, CtaTile<256, 256, 16>, WarpTile<16, 16, 16>, true, false>;
 
 #define TEST_KERNEL(Kernel) \
     do { \
@@ -592,16 +592,15 @@ int main(int argc, char**argv)
         printf("%s\n", (passed ? "PASSED": "FAILED")); \
     } while(false)
 
-    TEST_KERNEL(hgemm_128x128_16x16x16());
-    TEST_KERNEL(hgemm_256x128_16x16x16());
-    TEST_KERNEL(hgemm_128x256_16x16x16());
-    TEST_KERNEL(hgemm_256x256_16x16x16());
+    TEST_KERNEL(hgemm_128x128x16_16x16x16());
+    TEST_KERNEL(hgemm_256x128x16_16x16x16());
+    TEST_KERNEL(hgemm_128x256x16_16x16x16());
+    TEST_KERNEL(hgemm_256x256x16_16x16x16());
 
-    using hgemm_512x512_16x16x16 = GemmKernel<256, CtaTile<512, 512, 16>, WarpTile<16, 16, 16>, true, false>;
-    TEST_KERNEL(hgemm_512x512_16x16x16());
+    using hgemm_512x512x16_16x16x16 = GemmKernel<256, CtaTile<512, 512, 16>, WarpTile<16, 16, 16>, true, false>;
+    TEST_KERNEL(hgemm_512x512x16_16x16x16());
 
     using hgemm_128x128x32_16x16x16 = GemmKernel<256, CtaTile<128, 128, 32>, WarpTile<16, 16, 16>>;
     TEST_KERNEL(hgemm_128x128x32_16x16x16());
 
-#undef TEST_KERNEL
 }
