@@ -324,7 +324,7 @@ __global__ void gemm(GemmParams params) {
     wmma::fragment <wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> c_frag[
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
-    static_assert(WMMA_K == CtaTileT::K, "Current implementation does not support WMMA_K != CtaTile::K yet");
+    static_assert(CtaTileT::K % WMMA_K == 0);
     // Initialize the output to zero
     for (int m = 0; m < WARP_TILE_M / WMMA_M; ++m) {
         for (int n = 0; n < WARP_TILE_N / WMMA_N; ++n) {
@@ -361,16 +361,18 @@ __global__ void gemm(GemmParams params) {
 
         static_assert(WARP_TILE_N/WMMA_N <= 2 || !prefetchB, "TODO: the kernel will fail when warp n iteration > 2 and prefetch b");
 
+        for(int wmmaK = 0; wmmaK < CtaTileT::K;  wmmaK += WMMA_K)
+        {
         if(prefetchA) {
-            wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM * CtaTileT::K], CtaTileT::K);
+            wmma::load_matrix_sync(a_frag[0], &tileA[wrapStartM * CtaTileT::K+wmmaK], CtaTileT::K);
         }
         if(prefetchB) {
-            wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN * CtaTileT::K], CtaTileT::K);
+            wmma::load_matrix_sync(b_frag[0], &tileB[wrapStartN * CtaTileT::K+wmmaK], CtaTileT::K);
         }
         for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
             if(prefetchA) {
                 if (m < WARP_TILE_M / WMMA_M - 1) {
-                    wmma::load_matrix_sync(a_frag[(m + 1) % 2], &tileA[(wrapStartM + WMMA_M * (m + 1)) * CtaTileT::K],
+                    wmma::load_matrix_sync(a_frag[(m + 1) % 2], &tileA[(wrapStartM + WMMA_M * (m + 1)) * CtaTileT::K + wmmaK],
                                         CtaTileT::K);
                 }
                 for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
@@ -379,24 +381,25 @@ __global__ void gemm(GemmParams params) {
                         // Load the inputs
                         if (n < WARP_TILE_N / WMMA_N - 1) {
                             wmma::load_matrix_sync(b_frag[(n + 1) % 2],
-                                                &tileB[(wrapStartN + WMMA_N * (n + 1)) * CtaTileT::K], CtaTileT::K);
+                                                &tileB[(wrapStartN + WMMA_N * (n + 1)) * CtaTileT::K + wmmaK], CtaTileT::K);
                         }
                         // Perform the matrix multiplication
                         wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[n % 2], c_frag[m][n]);
                     }
                     else
                     {
-                        wmma::load_matrix_sync(b_frag[0], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K], CtaTileT::K);
+                        wmma::load_matrix_sync(b_frag[0], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K + wmmaK], CtaTileT::K);
                         wmma::mma_sync(c_frag[m][n], a_frag[m % 2], b_frag[0], c_frag[m][n]);
                     }
                 }
             } else {
                 for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
-                    wmma::load_matrix_sync(a_frag[1], &tileA[(wrapStartM + WMMA_M*m) * CtaTileT::K], CtaTileT::K);
-                    wmma::load_matrix_sync(b_frag[1], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K], CtaTileT::K);
+                    wmma::load_matrix_sync(a_frag[1], &tileA[(wrapStartM + WMMA_M*m) * CtaTileT::K + wmmaK], CtaTileT::K);
+                    wmma::load_matrix_sync(b_frag[1], &tileB[(wrapStartN + WMMA_N*n) * CtaTileT::K + wmmaK], CtaTileT::K);
                     wmma::mma_sync(c_frag[m][n], a_frag[1], b_frag[1], c_frag[m][n]);
                 }
             }
+        }
         }
         //This is essential, otherwise, some threads will override the shared memory while other ones using it
         __syncthreads();
@@ -603,6 +606,10 @@ bool testKernel(Kernel kernelFunc, int M, int N, int K)
 
     CUDA_PERROR(cudaDeviceSynchronize());
     CUDA_PERROR(cudaMemcpy(hRefC.data(), RefC, hRefC.size()*sizeof(half), cudaMemcpyDeviceToHost));
+    CUDA_PERROR(cudaFree(A));
+    CUDA_PERROR(cudaFree(B));
+    CUDA_PERROR(cudaFree(C));
+    CUDA_PERROR(cudaFree(RefC));
 
     bool hasErr = false;
     for(int i=0; i < hC.size(); ++i)
@@ -654,6 +661,9 @@ int main()
 
     using hgemm_512x512_16x16x16 = GemmKernel<256, CtaTile<512, 512, 16>, WarpTile<16, 16, 16>, true, false>;
     TEST_KERNEL(hgemm_512x512_16x16x16());
+
+    using hgemm_128x128x32_16x16x16 = GemmKernel<256, CtaTile<128, 128, 32>, WarpTile<16, 16, 16>>;
+    TEST_KERNEL(hgemm_128x128x32_16x16x16());
 
 #undef TEST_KERNEL
 }
