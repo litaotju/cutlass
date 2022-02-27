@@ -361,6 +361,8 @@ __global__ void gemm(GemmParams params) {
             WARP_TILE_M / WMMA_M][WARP_TILE_N / WMMA_N];
 
     static_assert(CtaTileT::K % WMMA_K == 0);
+    static_assert(CtaTileT::M % WMMA_M == 0);
+    static_assert(CtaTileT::N % WMMA_N == 0);
 
     for (int m = 0; m < WARP_TILE_M / WMMA_M; m += 1) {
         for (int n = 0; n < WARP_TILE_N / WMMA_N; n += 1) {
@@ -602,5 +604,10 @@ int main(int argc, char**argv)
 
     using hgemm_128x128x32_16x16x16 = GemmKernel<256, CtaTile<128, 128, 32>, WarpTile<16, 16, 16>>;
     TEST_KERNEL(hgemm_128x128x32_16x16x16());
+
+    using hgemm_128x128x32_32x8x16 = GemmKernel<256, CtaTile<128, 128, 32>, WarpTile<32, 8, 16>, true, false>;
+    TEST_KERNEL(hgemm_128x128x32_32x8x16());
+    using hgemm_128x128x32_8x32x16 = GemmKernel<256, CtaTile<128, 128, 32>, WarpTile<8, 32, 16>, true, false>;
+    TEST_KERNEL(hgemm_128x128x32_8x32x16());
 
 }
